@@ -1,0 +1,98 @@
+<Window x:Class="SafeLocalHarness.App.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ xmlns:views="clr-namespace:SafeLocalHarness.App.Views" xmlns:vm="clr-namespace:SafeLocalHarness.App.ViewModels"
+ Title="Local Studio" Icon="pack://application:,,,/Assets/LocalStudio.ico" Width="1180" Height="780" MinWidth="900" MinHeight="620" WindowStartupLocation="CenterScreen"
+ Background="{StaticResource CanvasBrush}" Foreground="{StaticResource PrimaryTextBrush}" UseLayoutRounding="True">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="Visible"/>
+        <ContextMenu x:Key="ChatItemMenu" x:Shared="False">
+            <MenuItem Header="HTML で書き出す…" Click="OnExportChatHtml"/>
+            <MenuItem Header="テキストで書き出す…" Click="OnExportChatText"/>
+            <Separator/>
+            <MenuItem Header="ごみ箱へ移す…" Click="OnRemoveChat"/>
+        </ContextMenu>
+        <DataTemplate DataType="{x:Type vm:ChatViewModel}"><views:ChatView/></DataTemplate>
+        <DataTemplate DataType="{x:Type vm:ProjectsViewModel}"><views:ProjectsView/></DataTemplate>
+        <DataTemplate DataType="{x:Type vm:SetupViewModel}"><views:SetupView/></DataTemplate>
+    </Window.Resources>
+    <Grid>
+        <Grid.ColumnDefinitions><ColumnDefinition Width="238"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+
+        <!-- Sidebar (approved mockup): logo and title, new chat, projects, setup. -->
+        <Border Background="{StaticResource SidebarBrush}" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,1,0">
+            <Grid Margin="14,20,14,16">
+                <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+                <StackPanel Orientation="Horizontal" Margin="6,0,0,22">
+                    <Image Source="pack://application:,,,/Assets/LocalStudio.png" Width="36" Height="36" RenderOptions.BitmapScalingMode="HighQuality" AutomationProperties.Name="Local Studio"/>
+                    <TextBlock Text="Local Studio" FontFamily="{StaticResource SerifFont}" FontSize="20" FontWeight="SemiBold" Foreground="{StaticResource HeadingBrush}" VerticalAlignment="Center" Margin="10,0,0,0"/>
+                </StackPanel>
+                <Button Grid.Row="1" Style="{StaticResource SidebarButton}" Command="{Binding NewChatCommand}" AutomationProperties.Name="新しいチャット">
+                    <StackPanel Orientation="Horizontal"><TextBlock Text="＋" Width="22" FontSize="15" Foreground="{StaticResource HeadingBrush}"/><TextBlock Text="新しいチャット" Foreground="{StaticResource HeadingBrush}"/></StackPanel>
+                </Button>
+                <Grid Grid.Row="2" Margin="10,18,4,6">
+                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="チャット" FontSize="12" Foreground="{StaticResource SecondaryTextBrush}" VerticalAlignment="Center" ToolTip="作ったアプリと、ファイル・PDF などのチャット。右クリックで書き出し・ごみ箱へ移す"/>
+                    <Button Grid.Column="1" Content="読み込む" Style="{StaticResource SidebarButton}" FontSize="11" Padding="8,3" Foreground="{StaticResource SecondaryTextBrush}"
+                            Command="{Binding Projects.ImportCartridgeCommand}" ToolTip="カートリッジ（.lscart）を読み込んで新しいプロジェクトとして追加します"/>
+                </Grid>
+                <!-- Every saved chat (apps and file work); the project of the open chat is SidebarSelection. -->
+                <ListBox Grid.Row="3" ItemsSource="{Binding Chats}" SelectedItem="{Binding SelectedChat}" Background="Transparent" BorderThickness="0"
+                         ScrollViewer.HorizontalScrollBarVisibility="Disabled" AutomationProperties.Name="チャット一覧">
+                    <ListBox.ItemContainerStyle>
+                        <Style TargetType="ListBoxItem">
+                            <Setter Property="Padding" Value="10,8"/><Setter Property="Margin" Value="0,1"/><Setter Property="Cursor" Value="Hand"/>
+                            <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                            <!-- On the item itself, so the keyboard (Shift+F10 / menu key) opens it too. -->
+                            <Setter Property="ContextMenu" Value="{StaticResource ChatItemMenu}"/>
+                            <Setter Property="AutomationProperties.Name" Value="{Binding Title}"/>
+                            <Setter Property="AutomationProperties.HelpText" Value="{Binding Subtitle}"/>
+                            <Setter Property="Template"><Setter.Value><ControlTemplate TargetType="ListBoxItem">
+                                <Border x:Name="Chrome" Background="Transparent" CornerRadius="9" Padding="{TemplateBinding Padding}"><ContentPresenter/></Border>
+                                <ControlTemplate.Triggers>
+                                    <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Chrome" Property="Background" Value="#80F7DFC2"/></Trigger>
+                                    <Trigger Property="IsSelected" Value="True"><Setter TargetName="Chrome" Property="Background" Value="{StaticResource SelectedProjectBrush}"/></Trigger>
+                                </ControlTemplate.Triggers>
+                            </ControlTemplate></Setter.Value></Setter>
+                        </Style>
+                    </ListBox.ItemContainerStyle>
+                    <ListBox.ItemTemplate>
+                        <DataTemplate>
+                            <StackPanel Background="Transparent" ToolTip="{Binding Title}">
+                                <TextBlock Text="{Binding Title}" FontSize="14" Foreground="{StaticResource HeadingBrush}" TextTrimming="CharacterEllipsis"/>
+                                <TextBlock Text="{Binding Subtitle}" FontSize="11" Foreground="{StaticResource SecondaryTextBrush}" Margin="0,2,0,0"/>
+                            </StackPanel>
+                        </DataTemplate>
+                    </ListBox.ItemTemplate>
+                </ListBox>
+                <StackPanel Grid.Row="4">
+                    <Border Height="1" Background="{StaticResource DividerBrush}" Opacity="0.5" Margin="4,8,4,8"/>
+                    <Button Style="{StaticResource SidebarButton}" Click="OnLibrariesClick" AutomationProperties.Name="ライブラリの棚" ToolTip="作るアプリで使うライブラリ（例: Chart.js）を追加・確認します">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="📚" Width="22" FontSize="15" Foreground="{StaticResource HeadingBrush}"/><TextBlock Text="ライブラリ" Foreground="{StaticResource HeadingBrush}"/></StackPanel>
+                    </Button>
+                    <Button Style="{StaticResource SidebarButton}" Command="{Binding ShowSetupCommand}" AutomationProperties.Name="セットアップ">
+                        <StackPanel Orientation="Horizontal"><TextBlock Text="⚙" Width="22" FontSize="15" Foreground="{StaticResource HeadingBrush}"/><TextBlock Text="セットアップ" Foreground="{StaticResource HeadingBrush}"/></StackPanel>
+                    </Button>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <Grid Grid.Column="1">
+            <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+            <!-- Actions of the open project, above its conversation. -->
+            <Border Background="{StaticResource CanvasBrush}" BorderBrush="{StaticResource DividerBrush}" BorderThickness="0,0,0,1" Padding="24,10"
+                    Visibility="{Binding ShowProjectBar, Converter={StaticResource Visible}}">
+                <Grid>
+                    <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                    <TextBlock Text="{Binding ProjectBarTitle}" FontFamily="{StaticResource SerifFont}" FontSize="17" Foreground="{StaticResource HeadingBrush}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+                    <StackPanel Grid.Column="1" Orientation="Horizontal">
+                        <Button Content="{Binding Projects.LaunchActionLabel}" Command="{Binding Projects.OpenAppCommand}" Style="{StaticResource ChoiceButton}" Margin="0,0,8,0"/>
+                        <Button Content="フォルダー" Command="{Binding Projects.OpenProjectCommand}" Style="{StaticResource ChoiceButton}" Margin="0,0,8,0"/>
+                        <Button Content="書き出す" Command="{Binding Projects.ExportCartridgeCommand}" Style="{StaticResource ChoiceButton}" Margin="0,0,8,0" ToolTip="ソース一式を1つの .lscart ファイルにまとめます（EXEは含めません）"/>
+                        <Button Content="詳細・操作確認" Command="{Binding ShowProjectDetailsCommand}" Style="{StaticResource ChoiceButton}"/>
+                    </StackPanel>
+                </Grid>
+            </Border>
+            <ContentControl Grid.Row="1" Content="{Binding CurrentPage}"/>
+        </Grid>
+    </Grid>
+</Window>
