@@ -507,7 +507,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
                 throw new InvalidDataException("修正案の置換サイズが許可範囲外です。");
             if (replacement.OldText.Equals(replacement.NewText, StringComparison.Ordinal))
                 throw new InvalidDataException("修正案に無変更置換が含まれています。");
-            if (replacement.NewText.Contains('�') || LocalWebAppGenerationEngine.HasForbiddenControlCharacters(replacement.NewText))
+            if (replacement.NewText.Contains('\uFFFD') || LocalWebAppGenerationEngine.HasForbiddenControlCharacters(replacement.NewText))
                 throw new InvalidDataException("修正案に不正な文字が含まれています。");
             if (!TryResolveUniqueRepairTarget(result, replacement.OldText, out var targetIndex, out var targetLength))
                 throw new InvalidDataException("修正対象は現在のソースに一意に一致しません。");
@@ -619,7 +619,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         var errors = new List<string>();
         Check(!string.IsNullOrWhiteSpace(source) && source.Length <= MaxSourceCharacters, "source.missing-or-too-large", errors);
         if (errors.Count > 0) return errors;
-        Check(!source.Contains("```", StringComparison.Ordinal) && !source.Contains('�') && !LocalWebAppGenerationEngine.HasForbiddenControlCharacters(source), "source.invalid-format-or-unicode", errors);
+        Check(!source.Contains("```", StringComparison.Ordinal) && !source.Contains('\uFFFD') && !LocalWebAppGenerationEngine.HasForbiddenControlCharacters(source), "source.invalid-format-or-unicode", errors);
         Check(!source.Contains("$\"", StringComparison.Ordinal) &&
               !source.Contains("$@\"", StringComparison.Ordinal) &&
               !source.Contains("@$\"", StringComparison.Ordinal), "source.csharp5-compatibility", errors);
@@ -660,7 +660,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
 
     internal static string UnwrapWholeSourceFence(string source)
     {
-        var trimmed = source.Trim().TrimStart('﻿');
+        var trimmed = source.Trim().TrimStart('\uFEFF');
         var match = Regex.Match(
             trimmed,
             @"\A```(?:csharp|cs)?[ \t]*\r?\n(?<source>[\s\S]*?)\r?\n```[ \t]*\z",
