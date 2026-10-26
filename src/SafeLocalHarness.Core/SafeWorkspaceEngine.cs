@@ -341,7 +341,7 @@ public sealed class SafeWorkspaceSession
     private static string Hash(byte[] bytes) => Convert.ToHexString(SHA256.HashData(bytes));
     private static void EnsureHealthyText(string text)
     {
-        if (text.Contains('\0') || text.Contains('�')) throw new InvalidDataException("NULまたはUnicode置換文字を含む内容は拒否されました。");
+        if (text.Contains('\0') || text.Contains('\uFFFD')) throw new InvalidDataException("NULまたはUnicode置換文字を含む内容は拒否されました。");
     }
     private static int CountOccurrences(string text, string value)
     {
