@@ -1,0 +1,39 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\SafeLocalHarness.Core\SafeLocalHarness.Core.csproj" />
+    <ProjectReference Include="..\SafeLocalHarness.Windows\SafeLocalHarness.Windows.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- One icon everywhere: the EXE (ApplicationIcon), the window and taskbar, and the in-app logo. -->
+    <Resource Include="Assets\LocalStudio.ico" />
+    <Resource Include="Assets\LocalStudio.png" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <WindowsSdkPackageVersion>10.0.19041.57</WindowsSdkPackageVersion>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\LocalStudio.ico</ApplicationIcon>
+    <AssemblyName>LocalStudio</AssemblyName>
+    <Product>LocalStudio</Product>
+    <Description>会話からローカルでアプリを作る、安全なAIスタジオ</Description>
+    <Version>0.16.0</Version>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(SelfContained)' == 'true'">
+    <PublishSingleFile>true</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <EnableCompressionInSingleFile>true</EnableCompressionInSingleFile>
+    <PublishTrimmed>false</PublishTrimmed>
+    <!-- Japanese UI only: other satellite languages are not shipped (smaller, and the local runtime pack lacks some). -->
+    <SatelliteResourceLanguages>ja</SatelliteResourceLanguages>
+  </PropertyGroup>
+
+</Project>
