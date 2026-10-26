@@ -440,7 +440,7 @@ public static class PowerPointOperations
         using var after = PresentationDocument.Open(outputPath, false);
         var oldSlides = ReadSlides(before);
         var newSlides = ReadSlides(after);
-        static string Key(SlideSummary slide) => string.Join("\u01", slide.Texts);
+        static string Key(SlideSummary slide) => string.Join("\u0001", slide.Texts);
         var problems = new List<string>();
         switch (edit.Op)
         {
@@ -451,7 +451,7 @@ public static class PowerPointOperations
                 if (!edit.With!.Contains(edit.Find!, StringComparison.Ordinal) && all.Contains(edit.Find!, StringComparison.Ordinal)) problems.Add($"「{edit.Find}」が残っています");
                 if (edit.With!.Length > 0 && !all.Contains(edit.With, StringComparison.Ordinal)) problems.Add($"「{edit.With}」が見つかりません");
                 // Every other text is as it was.
-                var expected = oldSlides.Select(slide => string.Join("\u01", slide.Texts.Select(text => text.Replace(edit.Find!, edit.With!, StringComparison.Ordinal)).Where(text => text.Trim().Length > 0)));
+                var expected = oldSlides.Select(slide => string.Join("\u0001", slide.Texts.Select(text => text.Replace(edit.Find!, edit.With!, StringComparison.Ordinal)).Where(text => text.Trim().Length > 0)));
                 if (!expected.SequenceEqual(newSlides.Select(Key))) problems.Add("置き換えたあとの文字が予定と違います");
                 break;
             }
@@ -480,7 +480,7 @@ public static class PowerPointOperations
             {
                 var at = AfterSlide(edit, oldSlides.Count)!.Value;
                 var expected = oldSlides.Select(Key).ToList();
-                var added = string.Join("\u01", new[] { edit.Text! }.Concat(edit.Values ?? []).Where(text => text.Trim().Length > 0));
+                var added = string.Join("\u0001", new[] { edit.Text! }.Concat(edit.Values ?? []).Where(text => text.Trim().Length > 0));
                 expected.Insert(at, added);
                 if (!expected.SequenceEqual(newSlides.Select(Key))) problems.Add("追加したスライドの位置か中身が予定と違います");
                 else if (newSlides[at].Title != edit.Text) problems.Add($"追加したスライドのタイトルが「{edit.Text}」になっていません");
