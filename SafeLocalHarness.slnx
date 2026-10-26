@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SafeLocalHarness.App/SafeLocalHarness.App.csproj" />
+    <Project Path="src/SafeLocalHarness.Core/SafeLocalHarness.Core.csproj" />
+    <Project Path="src/SafeLocalHarness.Windows/SafeLocalHarness.Windows.csproj" />
+    <Project Path="src/SafeLocalHarness.Workbench/SafeLocalHarness.Workbench.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/SafeLocalHarness.SmokeTests/SafeLocalHarness.SmokeTests.csproj" />
+  </Folder>
+</Solution>
