@@ -1,0 +1,2 @@
+{"fixture":"office-right-row","source":"qwen2.5-coder:1.5b office-drill --record 2026-10-11 (p3c9), exchange copied unchanged","input":"sales-xlsx","request":"みかんの単価を90に変えて","expect":{"preview":true,"textContains":"C3（みかん の 単価）: 80 → 90","served":1}}
+{"tool":"office","request":"みかんの単価を90に変えて","inputSha256":"FB44F8B41C0759A0F756170B56F0DCD13E39A88313FCFA1AEEA493B5348E732C","problems":[],"response":{"action":"edit","answer":null,"edits":[{"op":"set-cell","find":null,"with":null,"sheet":"売上","cell":"C3","value":"90","values":null}]},"time":"2026-10-11T20:57:13.6154169+09:00"}

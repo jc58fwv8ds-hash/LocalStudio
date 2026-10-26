@@ -1,0 +1,1 @@
+{"fixture":"office-largest-row","source":"office-drill 2026-10-11: the model answered みかん (observed response kept below as data only); now computed by the tool, so no exchange may happen","input":"sales-xlsx","request":"金額が一番大きいのはどの品名？","observed":{"action":"answer","answer":"みかん"},"expect":{"preview":false,"textContains":"りんご で、450","served":0}}

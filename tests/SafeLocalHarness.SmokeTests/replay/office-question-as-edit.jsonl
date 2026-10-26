@@ -1,0 +1,1 @@
+{"fixture":"office-question-as-edit","source":"office-drill 2026-10-11 run 13: a question answered with set-cell C2=80 (observed response kept as data only); now computed","input":"sales-xlsx","request":"単価が一番安いのは？","observed":{"action":"edit","edits":[{"op":"set-cell","sheet":"売上","cell":"C2","value":"80"}]},"expect":{"preview":false,"textContains":"みかん で、80","served":0}}
