@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\SafeLocalHarness.Core\SafeLocalHarness.Core.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <!-- 4-4b: Windows' own PDF renderer and OCR (Windows.Data.Pdf, Windows.Media.Ocr), called through the Windows SDK
+         projection (Microsoft.Windows.SDK.NET.Ref, Windows SDK licence; redistributable per the SDK redist list).
+         Downloaded with the user's approval on 2026-10-12 and bundled in vendor-packages. -->
+    <TargetFramework>net10.0-windows10.0.19041.0</TargetFramework>
+    <WindowsSdkPackageVersion>10.0.19041.57</WindowsSdkPackageVersion>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+</Project>
