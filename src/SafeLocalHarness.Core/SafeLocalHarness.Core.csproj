@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- The lock file pins each package's content hash; a changed package fails the restore. -->
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <!-- The distribution EXE is restored for win-x64 (it adds the trimming tasks package), so it has its own lock file. -->
+    <NuGetLockFilePath Condition="'$(RuntimeIdentifier)' != ''">packages.$(RuntimeIdentifier).lock.json</NuGetLockFilePath>
+    <RestoreLockedMode Condition="'$(RuntimeIdentifier)' == '' And Exists('packages.lock.json')">true</RestoreLockedMode>
+    <RestoreLockedMode Condition="'$(RuntimeIdentifier)' != '' And Exists('packages.$(RuntimeIdentifier).lock.json')">true</RestoreLockedMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 4-2 Word / Excel (Microsoft, MIT; downloaded with the user's approval on 2026-10-11, bundled in vendor-packages). -->
+    <PackageReference Include="DocumentFormat.OpenXml" Version="3.5.1" />
+    <!-- 4-3 PDF: PdfPig (Apache-2.0) reads, PDFsharp (MIT) writes; downloaded with the user's approval on 2026-10-11. -->
+    <PackageReference Include="PdfPig" Version="0.1.16" />
+    <PackageReference Include="PDFsharp" Version="6.2.4" />
+    <!-- Running generated web apps without a browser to check them (AngleSharp: MIT, Jint: BSD-2-Clause, Acornima: BSD-3-Clause);
+         downloaded with the user's approval on 2026-10-12. -->
+    <PackageReference Include="AngleSharp" Version="1.8.4" />
+    <PackageReference Include="AngleSharp.Js" Version="1.1.1" />
+    <PackageReference Include="Jint" Version="4.17.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+  </ItemGroup>
+
+</Project>
