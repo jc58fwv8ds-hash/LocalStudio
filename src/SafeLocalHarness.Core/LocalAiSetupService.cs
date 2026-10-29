@@ -116,7 +116,7 @@ public sealed class LocalAiSetupService : ILocalAiSetupService
         return new(own, runtime, assessment);
     }
 
-    /// <summary>Focus and Expert are only ever set here, from an explicit user choice on the Setup screen. Expert is session-only.</summary>
+    /// <summary>Focus and Expert are only ever set here, from an explicit user choice (the Setup screen or the chat's mode button). Expert is session-only.</summary>
     public Task SetModeAsync(ResourceMode mode, CancellationToken cancellationToken = default) =>
         _modeState.SetAsync(mode, cancellationToken);
 

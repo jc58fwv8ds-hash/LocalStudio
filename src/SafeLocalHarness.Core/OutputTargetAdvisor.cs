@@ -42,6 +42,18 @@ public static class OutputTargetAdvisor
             ContainsAny(request, "文字数カウンター", "文字カウント", "行数カウンター"))
             return new(StudioProjectKind.WindowsApp, "独立したWindows画面とEXEでの起動が目的に合います。", true);
 
+        // When the request names no form, what the parts can do decides (catalogue 2026-10-19: a PDF editor became an EXE,
+        // which has no PDF parts): PDFs are shown and edited with the Web shelf libraries pdf.js and pdf-lib, and Excel
+        // workbooks are read and written by the EXE helper XlsxLite.
+        // Changing the PDF's own text and rules is done by the EXE helper PdfLite (user's choice for the PDF editor spec,
+        // 2026-10-20); page work alone stays with the Web libraries.
+        if (ContainsAny(request, "PDF") && ContainsAny(request, "書き換", "文字を", "文字の", "罫線", "線の太さ", "線幅", "置換", "スライドのように", "パワーポイント", "PowerPoint"))
+            return new(StudioProjectKind.WindowsApp, "PDFの文字や罫線をそのまま書き換える部品（PdfLite）は、Windowsアプリ（EXE）で使えます。", true);
+        if (ContainsAny(request, "PDF") && ContainsAny(request, "編集", "書き換", "削除", "回転", "画像", "並べ替", "結合", "黒塗り", "表示"))
+            return new(StudioProjectKind.DesktopOrWebApp, "PDFを表示・編集する部品（pdf.js・pdf-lib）は、Webアプリで使えます。", true);
+        if (ContainsAny(request, "エクセル", "Excel", "xlsx") && ContainsAny(request, "まとめ", "集約", "読み", "取り込", "結合", "書き出", "集計", "ファイル"))
+            return new(StudioProjectKind.WindowsApp, "Excelファイルを読み書きする部品は、Windowsアプリ（EXE）で使えます。", true);
+
         if (ContainsAny(request, "計算フォーム", "入力フォーム", "管理画面", "ダッシュボード", "一覧表"))
             return new(StudioProjectKind.DesktopOrWebApp, "フォーム中心の小さなツールは、インストール不要のWeb形式で扱いやすくなります。", true);
 

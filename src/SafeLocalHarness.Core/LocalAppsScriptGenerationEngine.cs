@@ -156,7 +156,7 @@ public sealed class LocalAppsScriptGenerationEngine : IGenerativeProjectGenerato
             if (normalized.Fixes > 0)
                 progress?.Report(new("auto-fix", $"回答の形を機械的に整えました（{normalized.Fixes}件）", fraction + 0.04));
             candidate = normalized.Candidate;
-            failures = Validate(candidate, requirements, container);
+            failures = Validate(candidate, requirements, container, OriginalRequestOf(requestJson));
             if (failures.Count == 0)
             {
                 progress?.Report(new("candidate-accepted", "静的検査に合格しました", 0.7));
@@ -165,6 +165,16 @@ public sealed class LocalAppsScriptGenerationEngine : IGenerativeProjectGenerato
             progress?.Report(new("candidate-rejected", "検証で修正が必要な点を確認しました: " + string.Join(", ", failures.Take(6)), fraction + 0.05));
         }
         throw new InvalidDataException("GASを安全に完成できませんでした。プロジェクトは保存していません。検出内容: " + string.Join(", ", failures.Take(6)));
+    }
+
+    private static string? OriginalRequestOf(string requestJson)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(requestJson);
+            return document.RootElement.TryGetProperty("originalRequest", out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+        }
+        catch (JsonException) { return null; }
     }
 
     /// <summary>The project files: the model's .gs/.html files plus appsscript.json written by LocalStudio.</summary>
@@ -214,7 +224,14 @@ public sealed class LocalAppsScriptGenerationEngine : IGenerativeProjectGenerato
     public static NormalizeResult Normalize(GasCandidate candidate, IReadOnlyList<GeneratedRequirement> requirements)
     {
         var fixes = 0;
-        var files = (candidate.Files ?? []).Where(file => file is not null).ToList();
+        // The same mechanical JavaScript repairs as web apps (a line break written inside quotes, a const assigned again).
+        var files = (candidate.Files ?? []).Where(file => file is not null).Select(file =>
+        {
+            if (!(file.Name ?? "").EndsWith(".gs", StringComparison.OrdinalIgnoreCase) || file.Content is null) return file;
+            var repaired = GeneratedScriptAutoFix.Apply(file.Content);
+            fixes += repaired.Fixes;
+            return repaired.Fixes == 0 ? file : file with { Content = repaired.JavaScript };
+        }).ToList();
         fixes += files.RemoveAll(file => string.Equals(file.Name, GasStaticVerifier.ManifestFileName, StringComparison.OrdinalIgnoreCase));
         var gs = string.Join("\n", files.Where(file => (file.Name ?? "").EndsWith(".gs", StringComparison.OrdinalIgnoreCase)).Select(file => file.Content ?? ""));
         if (!Regex.IsMatch(gs, @"HtmlService\.", RegexOptions.CultureInvariant))
@@ -242,8 +259,20 @@ public sealed class LocalAppsScriptGenerationEngine : IGenerativeProjectGenerato
         return new(new GasCandidate(files, evidence), fixes);
     }
 
+    private static readonly (Regex Asks, Regex Uses, string Name, string Hint)[] GasMechanisms =
+    [
+        (new(@"(新しい|別の|集計用の?)シート|シートに(集計|書|まとめ|出力|一覧)", RegexOptions.CultureInvariant), new(@"\.setValues?\s*\(|\.appendRow\s*\(", RegexOptions.CultureInvariant),
+         "sheet-write", "write the results to the sheet with sheet.getRange(row, column, rows.length, rows[0].length).setValues(rows) or sheet.appendRow([...]); create the sheet with ss.insertSheet(name) when it does not exist"),
+        (new(@"メール", RegexOptions.CultureInvariant), new(@"\b(MailApp|GmailApp)\.", RegexOptions.CultureInvariant),
+         "mail", "send the mail with MailApp.sendEmail(Session.getActiveUser().getEmail(), subject, body)"),
+        (new(@"日以内|締め?切り?|期限|日前", RegexOptions.CultureInvariant), new(@"new\s+Date\b|getTime\s*\(|Utilities\.formatDate", RegexOptions.CultureInvariant),
+         "date", "compare dates as numbers: (new Date(cell).getTime() - new Date().getTime()) / 86400000"),
+        (new(@"チェックで|チェックボックス|チェック欄", RegexOptions.CultureInvariant), new(@"insertCheckboxes|requireCheckbox|isChecked|===?\s*true", RegexOptions.CultureInvariant),
+         "checkbox", "make tick boxes with range.insertCheckboxes() and read them as true / false values")
+    ];
+
     /// <summary>Everything that can be checked before writing files; the saved project is checked again by GasStaticVerifier.</summary>
-    public static IReadOnlyList<string> Validate(GasCandidate candidate, IReadOnlyList<GeneratedRequirement> requirements, GasContainer? container = null)
+    public static IReadOnlyList<string> Validate(GasCandidate candidate, IReadOnlyList<GeneratedRequirement> requirements, GasContainer? container = null, string? sourceRequest = null)
     {
         var errors = new List<string>();
         var files = candidate.Files ?? [];
@@ -265,6 +294,18 @@ public sealed class LocalAppsScriptGenerationEngine : IGenerativeProjectGenerato
         if (Regex.IsMatch(gs, @"\bTODO\b|ここに.{0,10}(実装|記述)", RegexOptions.CultureInvariant)) errors.Add("quality.no-placeholder");
         if (OpensTooMuch(gs)) errors.Add("gas.unbalanced-braces");
         if (DeletesRowsWhileWalkingForward(gs)) errors.Add("gas.delete-rows-forward");
+        // A script the Apps Script editor cannot even save was shipped (catalogue 2026-10-20): each file must parse.
+        foreach (var file in files.Where(file => file.Name.EndsWith(".gs", StringComparison.OrdinalIgnoreCase)))
+            if (GasStaticVerifier.SyntaxError(file.Content) is { } syntax)
+                errors.Add($"gas.syntax:{file.Name}: {syntax} (the line and column are in the message; check quotes, brackets and commas there, and write a line break inside a string as \\n)");
+        // What the request asks for must be done by the code, not only named (a form summary that never wrote to a sheet).
+        // The user's own words count too (a shift table asked for ticking was built without any tick box, 2026-10-20).
+        var asked = string.Join(" ", requirements.Select(requirement => requirement.Text).Append(sourceRequest ?? ""));
+        // "C2,D2" is not a range: a range is one A1 address such as "C2:D2" (getRange(row, column, rows, columns) for numbers).
+        if (Regex.IsMatch(gs, @"getRange\(\s*['""][A-Z]+['""]\s*\+[^;]*?['""],\s*[A-Z]+['""]", RegexOptions.CultureInvariant) || Regex.IsMatch(gs, @"getRange\(\s*['""][A-Z]+\d+,[A-Z]+\d+['""]", RegexOptions.CultureInvariant))
+            errors.Add("gas.range-address (a range like 'C2,D2' does not exist; use sheet.getRange(row, column, numRows, numColumns) with numbers, or one A1 range such as 'C2:D2')");
+        foreach (var (asks, uses, name, hint) in GasMechanisms)
+            if (asks.IsMatch(asked) && !uses.IsMatch(gs)) errors.Add($"requirement.mechanism-missing:{name} ({hint})");
         if (container is not null && !Regex.IsMatch(gs, $@"(?<![\w$.]){container.Service}\.", RegexOptions.CultureInvariant)) errors.Add("gas.container:" + container.Service);
         var evidence = candidate.Requirements ?? [];
         foreach (var requirement in requirements)

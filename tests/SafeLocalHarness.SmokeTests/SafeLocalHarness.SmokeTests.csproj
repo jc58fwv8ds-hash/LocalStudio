@@ -8,6 +8,10 @@
   <ItemGroup>
     <!-- Recorded model exchanges replayed without a model (one fixture per mistake seen in real use). -->
     <EmbeddedResource Include="replay\*.jsonl" LogicalName="replay/%(Filename)%(Extension)" />
+    <!-- The Excel helper given to generated Windows apps, compiled here too so it is checked against real workbooks. -->
+    <Compile Include="..\..\src\SafeLocalHarness.Core\Toolbox\XlsxLite.cs.txt" Link="Toolbox\XlsxLite.cs" />
+    <!-- The PDF helper likewise, checked here against PDFs made in the test and read back with PdfPig. -->
+    <Compile Include="..\..\src\SafeLocalHarness.Core\Toolbox\PdfLite.cs.txt" Link="Toolbox\PdfLite.cs" />
   </ItemGroup>
 
   <PropertyGroup>

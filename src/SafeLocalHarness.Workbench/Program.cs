@@ -38,6 +38,144 @@ internal static class WorkbenchProgram
                 return await RunConversationDrillAsync(RequiredOption(args, "--root"));
             if (args[0].Equals("bench", StringComparison.OrdinalIgnoreCase))
                 return await RunBenchmarkAsync(RequiredOption(args, "--root"), OptionalOption(args, "--cases"), HasFlag(args, "--spec"), OptionalOption(args, "--model"), HasFlag(args, "--gas"));
+            // --no-launch: built EXEs are not started (outside the hours the user allows screen use).
+            TestRootEnvironment.NoLaunch = HasFlag(args, "--no-launch");
+            // --expert: Expert mode for this run only, as the app's session-only choice (never written to settings).
+            TestRootEnvironment.Expert = HasFlag(args, "--expert");
+            if (args[0].Equals("agent", StringComparison.OrdinalIgnoreCase))
+                return await RunAgentAsync(RequiredOption(args, "--root"), RequiredOption(args, "--project"), RequiredOption(args, "--goal"),
+                    int.TryParse(OptionalOption(args, "--steps"), out var agentSteps) ? agentSteps : 24, HasFlag(args, "--behavior"), HasFlag(args, "--keep"));
+            // PDF editing phase 0: structure only (fonts, text commands, rules, widths); document text is never printed.
+            if (args[0].Equals("pdf-survey", StringComparison.OrdinalIgnoreCase))
+            {
+                var file = RequiredOption(args, "--file");
+                var split = (string? list) => (list ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                foreach (var page in PdfStructureSurvey.Survey(file, split(OptionalOption(args, "--query")))) Emit("pdf-page", page);
+                Emit("pdf-replacements", PdfStructureSurvey.Replacements(file, split(OptionalOption(args, "--replace"))));
+                return 0;
+            }
+            // PDF editing phase 0 trial: one in-place edit to a new file, then the saved file is read back and compared.
+            // Path commands only (operator names and numbers), for studying how rules are drawn; text operands are left out.
+            if (args[0].Equals("pdf-paths", StringComparison.OrdinalIgnoreCase))
+            {
+                using var document = PdfSharp.Pdf.IO.PdfReader.Open(RequiredOption(args, "--file"), PdfSharp.Pdf.IO.PdfDocumentOpenMode.Import);
+                var sequence = PdfSharp.Pdf.Content.ContentReader.ReadContent(document.Pages[int.Parse(RequiredOption(args, "--page"), System.Globalization.CultureInfo.InvariantCulture) - 1]);
+                var line = new StringBuilder();
+                var printed = 0;
+                foreach (var item in sequence.OfType<PdfSharp.Pdf.Content.Objects.COperator>())
+                {
+                    var name = item.OpCode.OpCodeName.ToString();
+                    if (name is "Tj" or "TJ" or "QuoteSingle" or "QuoteDouble") { line.Append("[text] "); continue; }
+                    line.Append(string.Join(" ", item.Operands.Select(operand => operand is PdfSharp.Pdf.Content.Objects.CString ? "(s)" : operand.ToString()))).Append(' ').Append(name).Append(" | ");
+                    if (name is "f" or "F" or "S" or "B" or "b" or "n" or "ET") { Console.WriteLine(line.ToString()); line.Clear(); if (++printed >= 60) break; }
+                }
+                return 0;
+            }
+            // One page as a PNG next to it (Windows renderer), to look at an edit; only inside ls-pdf-acceptance.
+            if (args[0].Equals("pdf-render", StringComparison.OrdinalIgnoreCase))
+            {
+                var full = Path.GetFullPath(RequiredOption(args, "--file"));
+                if (!Path.GetFileName(Path.GetDirectoryName(full)!).StartsWith("ls-pdf-", StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidOperationException("PDFは ls-pdf- で始まるフォルダーに置いてください。");
+                var pageNumber = int.Parse(RequiredOption(args, "--page"), System.Globalization.CultureInfo.InvariantCulture);
+                var png = await new SafeLocalHarness.Windows.WindowsPdfImaging().RenderPageAsync(full, pageNumber, double.Parse(OptionalOption(args, "--scale") ?? "2", System.Globalization.CultureInfo.InvariantCulture));
+                var target = Path.ChangeExtension(full, null) + $"_p{pageNumber}.png";
+                await File.WriteAllBytesAsync(target, png);
+                // --around <letter>: where that letter is in the image, so only that spot is looked at (pages with personal data).
+                object? around = null;
+                if (OptionalOption(args, "--around") is { } letterWanted)
+                {
+                    using var pig = UglyToad.PdfPig.PdfDocument.Open(full);
+                    var pigPage = pig.GetPage(pageNumber);
+                    var hit = pigPage.Letters.FirstOrDefault(letter => letter.Value == letterWanted);
+                    if (hit is not null)
+                    {
+                        using var image = new MemoryStream(png);
+                        var decoder = await Windows.Graphics.Imaging.BitmapDecoder.CreateAsync(image.AsRandomAccessStream());
+                        var factor = decoder.PixelWidth / pigPage.Width;
+                        around = new { x = (int)(hit.BoundingBox.Left * factor), y = (int)((pigPage.Height - hit.BoundingBox.Top) * factor), w = (int)(hit.BoundingBox.Width * factor), h = (int)(hit.BoundingBox.Height * factor) };
+                    }
+                }
+                Emit("pdf-render", new { target, bytes = png.Length, around });
+                return 0;
+            }
+            // The Excel helper's CombineSheets on real workbooks (each sheet named after its file), checked with the Open XML validator.
+            if (args[0].Equals("xlsx-combine", StringComparison.OrdinalIgnoreCase))
+            {
+                var output = Path.GetFullPath(RequiredOption(args, "--out"));
+                UserSpaceGuard.EnsureAllowed(output);
+                var files = RequiredOption(args, "--files").Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+                var sources = files.Select(file => new KeyValuePair<string, string>(System.Text.RegularExpressions.Regex.Match(Path.GetFileNameWithoutExtension(file), @"^\S+").Value, file)).ToList();
+                var summary = new List<string[]> { new[] { "学校名", "ファイル" } };
+                summary.AddRange(sources.Select(source => new[] { source.Key, Path.GetFileName(source.Value) }));
+                var notes = XlsxLite.CombineSheets(output, sources, "一覧", summary);
+                using var check = DocumentFormat.OpenXml.Packaging.SpreadsheetDocument.Open(output, false);
+                var errors = new DocumentFormat.OpenXml.Validation.OpenXmlValidator().Validate(check).Take(5).Select(error => error.Description + " @" + error.Path?.XPath).ToList();
+                var sheets = check.WorkbookPart!.WorksheetParts.Select(part => new
+                {
+                    cells = part.Worksheet!.Descendants<DocumentFormat.OpenXml.Spreadsheet.Cell>().Count(),
+                    styled = part.Worksheet!.Descendants<DocumentFormat.OpenXml.Spreadsheet.Cell>().Count(cell => cell.StyleIndex is not null && cell.StyleIndex.Value > 0),
+                    merges = part.Worksheet!.Descendants<DocumentFormat.OpenXml.Spreadsheet.MergeCell>().Count(),
+                    columns = part.Worksheet!.Descendants<DocumentFormat.OpenXml.Spreadsheet.Column>().Count(),
+                    drawings = part.DrawingsPart is null ? 0 : 1
+                }).ToList();
+                Emit("xlsx-combine", new { output, notes, errors, sheets });
+                return errors.Count == 0 ? 0 : 1;
+            }
+            // The helper generated PDF editors use, on a real PDF: one edit, saved to a new file, then read back and compared.
+            if (args[0].Equals("pdflite-trial", StringComparison.OrdinalIgnoreCase))
+            {
+                var file = RequiredOption(args, "--file");
+                var output = RequiredOption(args, "--out");
+                var pageNumber = int.Parse(RequiredOption(args, "--page"), System.Globalization.CultureInfo.InvariantCulture);
+                var find = OptionalOption(args, "--find");
+                var replacement = OptionalOption(args, "--replace") ?? "";
+                var family = OptionalOption(args, "--font");
+                var clock = System.Diagnostics.Stopwatch.StartNew();
+                var doc = PdfLite.Open(file);
+                var opened = clock.Elapsed.TotalSeconds;
+                PdfLiteEdit edit;
+                double? rule = null;
+                if (find is not null)
+                    edit = family is null ? doc.ReplaceText(pageNumber, find, replacement, 1) : doc.ReplaceTextWithFont(pageNumber, find, replacement, 1, family);
+                else if (OptionalOption(args, "--move") is { } move)
+                    edit = doc.MoveRule(pageNumber, int.Parse(RequiredOption(args, "--index"), System.Globalization.CultureInfo.InvariantCulture), double.Parse(move, System.Globalization.CultureInfo.InvariantCulture), 0);
+                else
+                {
+                    rule = double.Parse(RequiredOption(args, "--rule"), System.Globalization.CultureInfo.InvariantCulture);
+                    edit = doc.SetRuleThickness(pageNumber, -1, rule.Value);
+                }
+                Emit("pdflite-edit", new { edit.Done, edit.Message, edit.MissingLetters, edit.GrowthPoints, edit.UsedSubstituteFont, openSeconds = Math.Round(opened, 2), rules = doc.Rules(pageNumber).Count });
+                if (!edit.Done) return 1;
+                doc.Save(output);
+                Emit("pdflite-saved", new { seconds = Math.Round(clock.Elapsed.TotalSeconds, 2), bytes = new FileInfo(output).Length, original = new FileInfo(file).Length,
+                    prefixKept = File.ReadAllBytes(output).AsSpan(0, (int)new FileInfo(file).Length).SequenceEqual(File.ReadAllBytes(file)) });
+                Emit("pdf-verify", PdfInPlaceEdit.Verify(file, output, pageNumber, expected: find is null ? null : replacement,
+                    removed: find is not null && !replacement.Contains(find, StringComparison.Ordinal) ? find : null, find: find, ruleThickness: rule));
+                return 0;
+            }
+            if (args[0].Equals("pdf-edit-trial", StringComparison.OrdinalIgnoreCase))
+            {
+                var file = RequiredOption(args, "--file");
+                var output = RequiredOption(args, "--out");
+                var pageNumber = int.Parse(RequiredOption(args, "--page"), System.Globalization.CultureInfo.InvariantCulture);
+                var find = OptionalOption(args, "--find");
+                var replacement = OptionalOption(args, "--replace");
+                var edit = find is not null
+                    ? PdfInPlaceEdit.ReplaceText(file, output, pageNumber, find, replacement ?? "")
+                    : PdfInPlaceEdit.SetRuleThickness(file, output, pageNumber, double.Parse(RequiredOption(args, "--rule"), System.Globalization.CultureInfo.InvariantCulture));
+                Emit("pdf-edit", edit);
+                if (edit.Done)
+                    Emit("pdf-verify", PdfInPlaceEdit.Verify(file, output, pageNumber, expected: replacement, removed: find is not null && replacement is not null && !replacement.Contains(find, StringComparison.Ordinal) ? find : null, find: find,
+                        ruleThickness: find is null ? double.Parse(RequiredOption(args, "--rule"), System.Globalization.CultureInfo.InvariantCulture) : null));
+                return edit.Done ? 0 : 1;
+            }
+            if (args[0].Equals("catalog-judge", StringComparison.OrdinalIgnoreCase))
+                return await JudgeCatalogAsync(RequiredOption(args, "--runs"));
+            if (args[0].Equals("catalog", StringComparison.OrdinalIgnoreCase))
+                return HasFlag(args, "--list")
+                    ? ListCatalog(OptionalOption(args, "--cases"))
+                    : await RunCatalogAsync(RequiredOption(args, "--root"), OptionalOption(args, "--cases"));
             if (args[0].Equals("pull-model", StringComparison.OrdinalIgnoreCase))
                 return await RunFetchPinnedModelAsync(RequiredOption(args, "--root"), RequiredOption(args, "--model"));
             if (args[0].Equals("office-drill", StringComparison.OrdinalIgnoreCase))
@@ -115,7 +253,10 @@ internal static class WorkbenchProgram
             if (args[0].Equals("library-info", StringComparison.OrdinalIgnoreCase))
                 return await RunLibraryInfoAsync(RequiredOption(args, "--name"), OptionalOption(args, "--version"));
             if (args[0].Equals("library-fetch", StringComparison.OrdinalIgnoreCase))
-                return await RunLibraryFetchAsync(RequiredOption(args, "--root"), RequiredOption(args, "--name"), RequiredOption(args, "--version"), RequiredOption(args, "--integrity"), OptionalOption(args, "--files"), OptionalOption(args, "--element"));
+                return await RunLibraryFetchAsync(RequiredOption(args, "--root"), RequiredOption(args, "--name"), RequiredOption(args, "--version"), RequiredOption(args, "--integrity"), OptionalOption(args, "--files"), OptionalOption(args, "--element"), OptionalOption(args, "--guide-file"), OptionalOption(args, "--global"));
+            if (args[0].Equals("library-add-font", StringComparison.OrdinalIgnoreCase))
+                return RunLibraryAddFont(RequiredOption(args, "--root"), RequiredOption(args, "--name"), RequiredOption(args, "--version"), RequiredOption(args, "--family"),
+                    RequiredOption(args, "--font"), RequiredOption(args, "--license-file"), RequiredOption(args, "--source"), RequiredOption(args, "--guide-file"));
             if (args[0].Equals("library-app", StringComparison.OrdinalIgnoreCase))
                 return await RunLibraryAppAsync(RequiredOption(args, "--root"), RequiredOption(args, "--text"));
             if (args[0].Equals("behavior-check", StringComparison.OrdinalIgnoreCase))
@@ -135,7 +276,7 @@ internal static class WorkbenchProgram
             paths.EnsureCreated();
             var settings = new SettingsStore(paths);
             var hardware = SystemHardwareProbe.Capture(paths);
-            var resources = AdaptiveRuntimePolicy.Create(hardware, settings.Load().SelectedModel, settings.Load().ResourceMode, MemoryRelief.EstimateReclaimable());
+            var resources = AdaptiveRuntimePolicy.Create(hardware, settings.Load().SelectedModel, TestRootEnvironment.Expert ? ResourceMode.Expert : settings.Load().ResourceMode, MemoryRelief.EstimateReclaimable());
             await SystemHardwareProbe.SaveAsync(paths, hardware, resources);
             using var pressureProbe = new WindowsMemoryPressureProbe();
             using var pressureMonitor = new MemoryPressureMonitor(pressureProbe, () => settings.Load().ResourceMode, AdaptiveRuntimePolicy.EffectiveInstalledBytes(hardware));
@@ -160,33 +301,29 @@ internal static class WorkbenchProgram
             await using var runtime = new OllamaManager(paths, resourcePlan: resources, pressureMonitor: pressureMonitor);
             if (prepareModel) await EnsureRecommendedModelAsync(runtime, resources);
 
-            var plan = job.Plan;
-            if (plan is null)
-            {
-                if (resources.Band == RuntimeResourceBand.DeterministicOnly)
-                    throw new InvalidOperationException("現在の空き資源ではAIによる作業分解を開始できません。決定論的ツールは利用できます。");
-                using var planner = new LocalDevelopmentPlanningEngine(runtime, settings, resources: resources);
-                plan = await planner.PlanAsync(
-                    job.ProjectName,
-                    BuildPlanningRequest(job),
-                    new Progress<PlanningProgress>(value => Emit("planning", value)));
-            }
-            var validation = DevelopmentUnitGraph.Validate(plan);
-            if (!validation.Passed)
-                throw new InvalidDataException("Task DAGが不正です: " + string.Join(", ", validation.Errors));
-            ValidateRequirements(job, plan);
-            var planPath = Path.Combine(jobRoot, "effective-plan.json");
-            await File.WriteAllTextAsync(planPath, JsonSerializer.Serialize(plan, JsonOptions), new UTF8Encoding(false));
-            Emit("plan-ready", new { path = planPath, units = plan.Units.Count });
+            using LocalDevelopmentPlanningEngine? planner = resources.Band == RuntimeResourceBand.DeterministicOnly
+                ? null
+                : new LocalDevelopmentPlanningEngine(runtime, settings, resources: resources);
+            var destination = Path.Combine(paths.ProjectRoot, job.ProjectId);
+            var sessionRequest = new DevelopmentSessionRequest(
+                jobRoot,
+                destination,
+                job.ProjectId,
+                job.ProjectName,
+                job.AppPurpose,
+                job.SourceRequest,
+                job.RequirementTexts,
+                job.TechStack,
+                job.BuildInstructions,
+                job.DesignDecisions,
+                job.Plan);
+            var prepared = await new DevelopmentSessionService(planner).PrepareAsync(sessionRequest);
+            Emit("plan-ready", new { path = prepared.PlanPath, units = prepared.Plan.Units.Count });
             if (command == "plan") return 0;
             if (command != "run") return Usage("未対応のコマンドです: " + command);
 
-            var toolchain = ResolveToolchain(args, paths, plan);
-            var statePath = Path.Combine(jobRoot, "development-run.json");
+            var toolchain = ResolveToolchain(args, paths, prepared.Plan);
             var store = new DevelopmentUnitCandidateStore(Path.Combine(jobRoot, "artifacts"));
-            var state = File.Exists(statePath)
-                ? await DevelopmentRunCoordinator.LoadAsync(statePath)
-                : DevelopmentRunCoordinator.Create(plan);
             using var generator = new LocalDevelopmentUnitGenerationEngine(runtime, settings, resources: resources);
             var executor = new DevelopmentUnitExecutionEngine(
                 generator,
@@ -194,50 +331,28 @@ internal static class WorkbenchProgram
                 store,
                 runtime.UnloadModelsAsync);
             var maximumAttempts = OptionalPositiveInt(args, "--maximum-attempts") ?? int.MaxValue;
-            var execution = await executor.RunAsync(
-                plan,
-                state,
-                statePath,
-                job.SourceRequest,
-                new Progress<DevelopmentUnitExecutionProgress>(value => Emit("development", value)),
-                maximumAttempts);
-            if (!execution.Completed)
+            var destinationExisted = Directory.Exists(destination);
+            var session = await new DevelopmentSessionService(planner, executor, store).RunAsync(
+                sessionRequest,
+                progress: new Progress<DevelopmentUnitExecutionProgress>(value => Emit("development", value)),
+                maximumUnitAttempts: maximumAttempts);
+            if (session.Stage is DevelopmentSessionStage.Paused or DevelopmentSessionStage.Blocked)
             {
                 Emit("not-complete", new
                 {
-                    blocked = execution.BlockedUnitIds,
-                    units = execution.State.Units.Select(item => new { item.UnitId, status = item.Status.ToString(), item.Attempt, item.LastError })
+                    blocked = session.BlockedUnitIds,
+                    units = session.State.Units.Select(item => new { item.UnitId, status = item.Status.ToString(), item.Attempt, item.LastError })
                 });
-                return execution.BlockedUnitIds.Count > 0 ? 3 : 2;
+                return session.Stage == DevelopmentSessionStage.Blocked ? 3 : 2;
             }
 
-            var destination = Path.Combine(paths.ProjectRoot, job.ProjectId);
-            if (Directory.Exists(destination))
+            if (session.CompletionAllowed)
             {
-                var inspection = await ProjectCartridgeStore.InspectAsync(destination);
-                if (inspection.CanResume && inspection.Cartridge.ProjectId.Equals(job.ProjectId, StringComparison.Ordinal))
-                {
-                    Emit("already-stable", new { destination, inspection.Cartridge.VerificationStatus });
-                    return 0;
-                }
-                throw new IOException("同名の未確認プロジェクトが既に存在します。上書きは行いません: " + destination);
+                Emit(destinationExisted ? "already-stable" : "stable", new { destination = session.ProjectRoot, session.Stage, session.CompletionAllowed });
+                return 0;
             }
-
-            var result = await new DevelopmentProjectAssembler(store).AssembleAsync(
-                plan,
-                execution.State,
-                new DevelopmentProjectAssemblyRequest(
-                    destination,
-                    job.ProjectId,
-                    job.ProjectName,
-                    job.AppPurpose,
-                    job.SourceRequest,
-                    job.RequirementTexts,
-                    job.TechStack,
-                    job.BuildInstructions,
-                    job.DesignDecisions));
-            Emit("stable", result);
-            return result.CompletionAllowed ? 0 : 4;
+            Emit("assembled-awaiting-evidence", new { destination = session.ProjectRoot, session.Stage, session.CompletionAllowed });
+            return 4;
         }
         catch (Exception ex)
         {
@@ -264,30 +379,6 @@ internal static class WorkbenchProgram
         if (job.SourceRequest.Length > 200_000) throw new InvalidDataException("sourceRequestが上限を超えています。");
         if (job.RequirementTexts.Count == 0 || job.RequirementTexts.Any(item => string.IsNullOrWhiteSpace(item.Key) || string.IsNullOrWhiteSpace(item.Value)))
             throw new InvalidDataException("Requirement LedgerのIDと本文は必須です。");
-    }
-
-    private static void ValidateRequirements(DevelopmentJobDefinition job, DevelopmentUnitPlan plan)
-    {
-        var referenced = plan.Units.SelectMany(unit => unit.RequirementIds).ToHashSet(StringComparer.Ordinal);
-        var missing = job.RequirementTexts.Keys.Where(id => !referenced.Contains(id)).ToArray();
-        var unknown = referenced.Where(id => !job.RequirementTexts.ContainsKey(id)).ToArray();
-        if (missing.Length > 0 || unknown.Length > 0)
-            throw new InvalidDataException($"Requirement LedgerとTask DAGが一致しません。未割当={string.Join(',', missing)} 不明={string.Join(',', unknown)}");
-    }
-
-    private static string BuildPlanningRequest(DevelopmentJobDefinition job)
-    {
-        var ledger = string.Join("\n", job.RequirementTexts.Select(item => $"{item.Key}: {item.Value}"));
-        return $"""
-            PURPOSE:
-            {job.AppPurpose}
-
-            REQUIREMENT LEDGER IDS (every ID must appear in at least one unit):
-            {ledger}
-
-            USER REQUEST:
-            {job.SourceRequest}
-            """;
     }
 
     private static async Task EnsureRecommendedModelAsync(ILocalModelRuntime runtime, RuntimeResourcePlan resources)
@@ -757,7 +848,7 @@ internal static class WorkbenchProgram
     /// 4-5 drill: downloads one npm package version into a test root (the expected SHA-512 is given on the command line, as
     /// the approval), drafts its guide with the AI and puts the chosen files on the test root's shelf.
     /// </summary>
-    private static async Task<int> RunLibraryFetchAsync(string root, string name, string version, string integrity, string? files, string? element = null)
+    private static async Task<int> RunLibraryFetchAsync(string root, string name, string version, string integrity, string? files, string? element = null, string? guideFile = null, string? global = null)
     {
         await using var environment = TestRootEnvironment.Create(root);
         using var http = new HttpClient { Timeout = TimeSpan.FromMinutes(5) };
@@ -767,12 +858,34 @@ internal static class WorkbenchProgram
         var fetched = await source.FetchAsync(info);
         var chosen = string.IsNullOrWhiteSpace(files) ? fetched.Candidates.Take(1).ToArray()
             : files.Split('|').Select(file => fetched.Candidates.First(candidate => Path.GetFileName(candidate) == file)).ToArray();
-        using var drafter = new LibraryGuideDrafter(environment.Runtime, environment.Settings);
         var clock = System.Diagnostics.Stopwatch.StartNew();
-        var guide = await drafter.DraftAsync(name, version, fetched.DetectedGlobal, fetched.Readme);
-        var entry = LibraryShelf.ForUser(environment.Paths).Add(new LibraryDraft(name, version, info.License, info.TarballUrl, fetched.DetectedGlobal, chosen, guide, element));
+        // --guide-file: a guide written and checked by hand (the model's drafts named functions that do not exist, 2026-10-19).
+        string guide;
+        if (guideFile is not null) guide = await File.ReadAllTextAsync(guideFile);
+        else
+        {
+            using var drafter = new LibraryGuideDrafter(environment.Runtime, environment.Settings);
+            guide = await drafter.DraftAsync(name, version, fetched.DetectedGlobal, fetched.Readme);
+        }
+        var entry = LibraryShelf.ForUser(environment.Paths).Add(new LibraryDraft(NpmLibrarySource.ShelfName(name), version, info.License, info.TarballUrl, global ?? fetched.DetectedGlobal, chosen, guide, element));
         Emit("library-fetch", new { ungrounded = LibraryGuideDrafter.UngroundedCode(guide, fetched.Readme), readmeCharacters = fetched.Readme?.Length, fetched.DownloadedBytes, candidates = fetched.Candidates.Select(Path.GetFileName), fetched.DetectedGlobal, chosen = chosen.Select(Path.GetFileName), guideSeconds = Math.Round(clock.Elapsed.TotalSeconds, 1), guide, entry.Key, entry.Folder });
         await environment.Runtime.UnloadModelsAsync();
+        return 0;
+    }
+
+    /// <summary>
+    /// Puts a downloaded, verified font (TrueType/OpenType, OFL) on the test root's shelf as a *.font.js script with its
+    /// licence, so web apps can embed Japanese text into PDFs. The guide is written by hand, not by the model.
+    /// </summary>
+    private static int RunLibraryAddFont(string root, string name, string version, string family, string font, string licenseFile, string source, string guideFile)
+    {
+        var paths = TestRootEnvironment.PathsFor(root);
+        var staging = Path.Combine(paths.Root, "downloads", "font-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(staging);
+        var script = Path.Combine(staging, Path.GetFileNameWithoutExtension(font) + ".font.js");
+        File.WriteAllText(script, LibraryShelf.WrapFont(File.ReadAllBytes(font), family, File.ReadAllText(licenseFile)), new UTF8Encoding(false));
+        var entry = LibraryShelf.ForUser(paths).Add(new LibraryDraft(name, version, "OFL-1.1", source, LibraryShelf.FontGlobal, [script], File.ReadAllText(guideFile)));
+        Emit("library-add-font", new { entry.Manifest.Name, entry.Manifest.Version, bytes = new FileInfo(script).Length, entry.Folder });
         return 0;
     }
 
@@ -919,6 +1032,127 @@ internal static class WorkbenchProgram
         return 0;
     }
 
+    /// <summary>
+    /// The agent loop on a project of the test root: the local model looks, edits and is checked until the goal is met.
+    /// The kind follows the files (Program.cs: EXE, .gs: GAS, otherwise Web). --behavior starts built EXEs (screen use),
+    /// --keep keeps the changes of a failed run (otherwise they are rolled back from the run snapshot).
+    /// </summary>
+    private static async Task<int> RunAgentAsync(string root, string project, string goal, int steps, bool behavior, bool keep)
+    {
+        await using var environment = TestRootEnvironment.Create(root);
+        var full = Path.GetFullPath(project);
+        var check = File.Exists(Path.Combine(full, "Program.cs"))
+            ? AgentChecks.Windows(goal, behavior && !TestRootEnvironment.NoLaunch ? WindowsAppBehaviorChecker.CheckAsync : null)
+            : Directory.EnumerateFiles(full, "*.gs").Any() ? AgentChecks.AppsScript(false) : AgentChecks.WebAsync;
+        await environment.Runtime.EnsureServerAsync();
+        var model = environment.Settings.Load().SelectedModel;
+        await environment.Runtime.EnsureModelFitsAsync(model);
+        var session = await new SafeWorkspaceEngine(environment.Paths).StartAsync(full);
+        var loop = new AgentLoop(new OllamaAgentModel(environment.Runtime, model, environment.Resources), check, steps);
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        loop.StepCompleted += step => Emit("agent-step", new { step, seconds = Math.Round(clock.Elapsed.TotalSeconds) });
+        var outcome = await loop.RunAsync(session, full, goal);
+        if (outcome.Completed) await session.CompleteAsync();
+        else if (!keep) await session.RollbackAsync();
+        await environment.Runtime.UnloadModelsAsync();
+        Emit("agent-result", new { outcome.Completed, outcome.Reason, outcome.Checks, steps = outcome.Steps.Count, outcome.LastFindings, seconds = Math.Round(clock.Elapsed.TotalSeconds), runId = session.RunId });
+        return outcome.Completed ? 0 : 1;
+    }
+
+    /// <summary>The catalogue without a model: each request with the capabilities the harness does not give yet.</summary>
+    private static int ListCatalog(string? filter)
+    {
+        foreach (var item in RequirementsCatalog.Select(filter))
+            Emit("catalog-case", new { item.Id, item.Category, kind = item.Kind.ToString(), size = item.Size.ToString(), item.Needs, gaps = RequirementsCatalog.Gaps(item) });
+        return 0;
+    }
+
+    /// <summary>
+    /// Runs catalogue requests through the real conversation (as the bench does) and reports pass rates per category.
+    /// --cases takes ids, categories, kind:WindowsApp or size:Large. Windows cases launch the built EXE to check it,
+    /// so they are run only while screen operation is allowed.
+    /// </summary>
+    private static async Task<int> RunCatalogAsync(string root, string? filter)
+    {
+        await using var environment = TestRootEnvironment.Create(root);
+        environment.Web.PreferAppSpec = true;
+        var runs = new List<CatalogRun>();
+        foreach (var item in RequirementsCatalog.Select(filter))
+        {
+            var conversation = environment.NewConversation();
+            var rejected = 0;
+            conversation.CreationProgress += progress =>
+            {
+                if (progress.Stage == "candidate-rejected") Interlocked.Increment(ref rejected);
+                if (progress.Stage is "candidate-rejected" or "app-spec-rejected" or "app-spec-fallback" or "auto-fix" or "agent-repair" or "agent-repair-step" or "agent-repair-ready" or "feature-growth" or "feature-growth-step" or "feature-growth-result")
+                    Emit("catalog-progress", new { item.Id, progress.Stage, progress.Message });
+            };
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            string? failure = null;
+            try
+            {
+                await conversation.SubmitAsync(item.Request);
+                if (conversation.Stage == ConversationStage.Clarifying)
+                    await conversation.ChooseAsync("kind:" + item.Kind);
+                if (conversation.Messages[^1].Choices.Any(choice => choice.Id == ConversationOrchestrator.LocalOnlyChoice))
+                    await conversation.ChooseAsync(ConversationOrchestrator.LocalOnlyChoice);
+                if (conversation.Messages[^1].Choices.Any(choice => choice.Id == ConversationOrchestrator.StartChoice))
+                    await conversation.ChooseAsync(ConversationOrchestrator.StartChoice);
+                if (conversation.Stage != ConversationStage.Completed) failure = conversation.Messages[^1].Text;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                failure = ex.Message;
+            }
+            var created = conversation.Stage == ConversationStage.Completed && conversation.ProjectPath is not null;
+            var verdict = created ? await RequirementsCatalog.JudgeAsync(item, conversation.ProjectPath!) : new CatalogVerdict(CatalogVerdict.NotCreated, ["not-created"]);
+            var run = new CatalogRun(item.Id, item.Category, item.Kind.ToString(), item.Size.ToString(), created, verdict.Verdict == CatalogVerdict.Verified, verdict.Misses,
+                rejected + 1, Math.Round(clock.Elapsed.TotalSeconds, 1), failure is null ? null : failure[..Math.Min(failure.Length, 300)], verdict.Verdict);
+            runs.Add(run);
+            Emit("catalog-run", new { run, project = conversation.ProjectPath, madeKind = created ? RequirementsCatalog.MadeKind(conversation.ProjectPath!) : null });
+        }
+        await environment.Runtime.UnloadModelsAsync();
+        var scores = RequirementsCatalog.Score(runs);
+        var reportPath = Path.Combine(environment.Paths.Root, $"catalog-{DateTime.Now:yyyyMMdd-HHmmss}.json");
+        await File.WriteAllTextAsync(reportPath, JsonSerializer.Serialize(new { at = DateTimeOffset.Now, model = environment.Settings.Load().SelectedModel, scores, runs }, JsonOptions), new UTF8Encoding(false));
+        Emit("catalog-result", new { scores, reportPath });
+        return 0;
+    }
+
+    /// <summary>
+    /// Judges projects an earlier catalogue run made (the catalog-run lines of its output, one or more files separated
+    /// by ';'), without a model: the latest project of each case is played against the hand-written acceptance.
+    /// </summary>
+    private static async Task<int> JudgeCatalogAsync(string runFiles)
+    {
+        var latest = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var file in runFiles.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            foreach (var line in await File.ReadAllLinesAsync(file))
+            {
+                if (!line.Contains("\"catalog-run\"", StringComparison.Ordinal)) continue;
+                try
+                {
+                    using var document = JsonDocument.Parse(line);
+                    var data = document.RootElement.TryGetProperty("value", out var inner) ? inner : document.RootElement;
+                    if (data.TryGetProperty("run", out var run) && (run.TryGetProperty("CaseId", out var id) || run.TryGetProperty("caseId", out id)) &&
+                        data.TryGetProperty("project", out var project) && project.ValueKind == JsonValueKind.String)
+                        latest[id.GetString()!] = project.GetString()!;
+                }
+                catch (JsonException) { }
+            }
+        var runs = new List<CatalogRun>();
+        foreach (var item in RequirementsCatalog.Cases.Where(item => latest.ContainsKey(item.Id)))
+        {
+            var verdict = Directory.Exists(latest[item.Id]) ? await RequirementsCatalog.JudgeAsync(item, latest[item.Id]) : new CatalogVerdict(CatalogVerdict.NotCreated, ["project-missing"]);
+            var run = new CatalogRun(item.Id, item.Category, item.Kind.ToString(), item.Size.ToString(), verdict.Verdict != CatalogVerdict.NotCreated,
+                verdict.Verdict == CatalogVerdict.Verified, verdict.Misses, 0, 0, null, verdict.Verdict);
+            runs.Add(run);
+            Emit("catalog-judged", new { run, project = latest[item.Id], madeKind = RequirementsCatalog.MadeKind(latest[item.Id]) });
+        }
+        Emit("catalog-result", new { scores = RequirementsCatalog.Score(runs), verified = runs.Count(run => run.Passed), unverified = runs.Count(run => run.Verdict == CatalogVerdict.Unverified), wrong = runs.Count(run => run.Verdict == CatalogVerdict.Wrong), cases = runs.Count });
+        return 0;
+    }
+
     private static async Task<int> RunRollbackDrillAsync(string root)
     {
         MemoryRelief.Enabled = true;
@@ -1030,6 +1264,22 @@ internal sealed class TestRootEnvironment : IAsyncDisposable
     public LocalImageDescriber Describer { get; }
     // Windows EXE generation, wired as the app wires it (app drills of EXE requests stopped without it, 2026-10-13).
     public LocalWindowsAppGenerationEngine? Windows { get; init; }
+    public RuntimeResourcePlan? Resources { get; init; }
+
+    /// <summary>The test root's folders (same rules as Create, without starting anything).</summary>
+    public static AppPaths PathsFor(string root)
+    {
+        var full = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar);
+        var real = AppPaths.ForCurrentUser();
+        var realRoot = real.Root.TrimEnd(Path.DirectorySeparatorChar);
+        if (full.Equals(realRoot, StringComparison.OrdinalIgnoreCase) || full.StartsWith(realRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("演習と計測は実データのフォルダでは実行しません。");
+        UserSpaceGuard.EnsureAllowed(full);
+        var paths = new AppPaths(full, real.RuntimeRoot, real.ModelRoot, Path.Combine(full, "state"),
+            Path.Combine(full, "logs"), Path.Combine(full, "downloads"), Path.Combine(full, "projects"));
+        paths.EnsureCreated();
+        return paths;
+    }
 
     public static TestRootEnvironment Create(string root, string? model = null)
     {
@@ -1055,28 +1305,35 @@ internal sealed class TestRootEnvironment : IAsyncDisposable
             settings.SaveAsync(settings.Load() with { SelectedModel = model }).GetAwaiter().GetResult();
         }
         var hardware = SystemHardwareProbe.Capture(paths);
-        var resources = AdaptiveRuntimePolicy.Create(hardware, settings.Load().SelectedModel, settings.Load().ResourceMode, MemoryRelief.EstimateReclaimable());
+        var resources = AdaptiveRuntimePolicy.Create(hardware, settings.Load().SelectedModel, Expert ? ResourceMode.Expert : settings.Load().ResourceMode, MemoryRelief.EstimateReclaimable());
         var pressureProbe = new WindowsMemoryPressureProbe();
-        var pressureMonitor = new MemoryPressureMonitor(pressureProbe, () => settings.Load().ResourceMode, AdaptiveRuntimePolicy.EffectiveInstalledBytes(hardware));
+        var pressureMonitor = new MemoryPressureMonitor(pressureProbe, () => Expert ? ResourceMode.Expert : settings.Load().ResourceMode, AdaptiveRuntimePolicy.EffectiveInstalledBytes(hardware));
         var runtime = new OllamaManager(paths, resourcePlan: resources, pressureMonitor: pressureMonitor);
         return new(paths, settings, pressureProbe, pressureMonitor, runtime,
             new LocalPlanningEngine(runtime, resources: resources),
             // 4-5: the test root has its own library shelf.
-            new LocalWebAppGenerationEngine(runtime, settings, resources: resources) { Libraries = LibraryShelf.ForUser(paths) },
+            new LocalWebAppGenerationEngine(runtime, settings, resources: resources) { Libraries = LibraryShelf.ForUser(paths), WriteAcceptance = true },
             new LocalAppsScriptGenerationEngine(runtime, settings, resources: resources),
             new LocalImageDescriber(runtime, resources: resources))
         {
-            Windows = new LocalWindowsAppGenerationEngine(runtime, settings, paths, resources: resources) { BehaviorCheck = WindowsAppBehaviorChecker.CheckAsync }
+            Windows = new LocalWindowsAppGenerationEngine(runtime, settings, paths, resources: resources) { BehaviorCheck = NoLaunch ? null : WindowsAppBehaviorChecker.CheckAsync },
+            Resources = resources
         };
     }
 
+    public static bool NoLaunch { get; set; }
+    public static bool Expert { get; set; }
+
+    public FeatureGrowth Growth() => new(Paths, Runtime, () => Settings.Load().SelectedModel, Resources, NoLaunch ? null : WindowsAppBehaviorChecker.CheckAsync);
+
     public ConversationOrchestrator NewConversation() => new(
-        new HybridPlanningEngine(Planner), Planner, new ProjectScaffolder(Paths, generativeGenerator: Web, windowsGenerativeGenerator: Windows, appsScriptGenerator: Gas),
+        new HybridPlanningEngine(Planner), Planner, new ProjectScaffolder(Paths, generativeGenerator: Web, windowsGenerativeGenerator: Windows, appsScriptGenerator: Gas) { Repair = Growth().RepairAsync },
         ConversationLog.CreateSession(Paths), () => Settings.Load().SelectedModel,
         new KindRoutingImprover(new WebProjectImprover(Web), new GasProjectImprover(Gas)), Describer)
     {
         // Hand-over zips stay inside the test root, never in the user's Documents.
-        GasHandoverRoot = Path.Combine(Paths.Root, "gas-handover")
+        GasHandoverRoot = Path.Combine(Paths.Root, "gas-handover"),
+        Growth = Growth()
     };
 
     public async ValueTask DisposeAsync()

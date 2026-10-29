@@ -1,0 +1,7 @@
+# The helpers are C# 5 sources for the Windows built-in compiler, which has no nullable annotations. The smoke tests
+# also compile them with nullable checks on; these warnings only say the C# 5 code is not annotated.
+[*.cs.txt]
+dotnet_diagnostic.CS8600.severity = none
+dotnet_diagnostic.CS8602.severity = none
+dotnet_diagnostic.CS8604.severity = none
+dotnet_diagnostic.CS8625.severity = none

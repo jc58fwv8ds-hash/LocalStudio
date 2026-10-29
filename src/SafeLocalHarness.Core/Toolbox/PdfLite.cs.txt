@@ -1,0 +1,1597 @@
+// Reviewed helper written for the C# 5 compiler of Windows; newer compilers' null-annotation warnings do not apply to it.
+#pragma warning disable
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+
+/// <summary>
+/// LocalStudio toolbox: edits a PDF's own text and rules in place with the .NET Framework built into Windows (no Acrobat,
+/// no download). Text is changed inside its show commands with the letters its embedded font already has; letters the
+/// font lacks are written with a Japanese Windows font (MS Gothic or MS Mincho, referenced, not embedded) only when asked.
+/// Rules drawn as thin filled rectangles get a new thickness or position. Nothing is painted over and pages are never
+/// turned into images. The original file is never written: Save appends the changes to a copy (incremental update),
+/// so every byte of the original stays as it was. Encrypted PDFs are refused.
+/// </summary>
+public static class PdfLite
+{
+    /// <summary>Opens a PDF for editing (read only; the file itself is never changed).</summary>
+    public static PdfLiteDocument Open(string path)
+    {
+        return new PdfLiteDocument(path);
+    }
+}
+
+/// <summary>What an edit did, or why it was not done (then nothing changed).</summary>
+public sealed class PdfLiteEdit
+{
+    public bool Done { get; set; }
+    public string Message { get; set; }
+    public int Page { get; set; }
+    /// <summary>Letters the embedded font does not have (ReplaceTextWithFont can write them with a Windows font).</summary>
+    public string MissingLetters { get; set; }
+    /// <summary>How much wider (points, roughly) the changed text is than before; a positive value may collide with what is to its right.</summary>
+    public double GrowthPoints { get; set; }
+    public bool UsedSubstituteFont { get; set; }
+    public int Count { get; set; }
+}
+
+/// <summary>A rule (a thin filled rectangle) on a page, in points from the page's bottom left.</summary>
+public sealed class PdfLiteRule
+{
+    public int Index { get; set; }
+    public bool Horizontal { get; set; }
+    public double Left { get; set; }
+    public double Bottom { get; set; }
+    public double Width { get; set; }
+    public double Height { get; set; }
+    /// <summary>Thickness in points (height of a horizontal rule, width of a vertical one).</summary>
+    public double Thickness { get; set; }
+}
+
+public sealed class PdfLiteDocument
+{
+    private readonly string _path;
+    private readonly byte[] _data;
+    private readonly Dictionary<int, long[]> _xref = new Dictionary<int, long[]>();
+    private readonly Dictionary<int, PdfLiteObject> _cache = new Dictionary<int, PdfLiteObject>();
+    private readonly Dictionary<int, List<KeyValuePair<int, int>>> _objectStreams = new Dictionary<int, List<KeyValuePair<int, int>>>();
+    private readonly Dictionary<int, byte[]> _objectStreamData = new Dictionary<int, byte[]>();
+    private PdfLiteDict _trailer;
+    private long _lastXref;
+    private int _originalSize;
+    private readonly List<int> _pages = new List<int>();
+
+    // Edited state (rebuilt from the history on undo and redo).
+    private readonly Dictionary<int, List<PdfLiteOp>> _pageOps = new Dictionary<int, List<PdfLiteOp>>();
+    private readonly Dictionary<int, PdfLiteObject> _written = new Dictionary<int, PdfLiteObject>();
+    private readonly Dictionary<int, string> _substituteFonts = new Dictionary<int, string>();
+    private readonly Dictionary<string, int[]> _substituteObjects = new Dictionary<string, int[]>();
+    private readonly Dictionary<string, SortedSet<int>> _substituteCodes = new Dictionary<string, SortedSet<int>>();
+    private int _nextObject;
+    private readonly List<EditStep> _history = new List<EditStep>();
+    private int _applied;
+
+    internal PdfLiteDocument(string path)
+    {
+        _path = Path.GetFullPath(path);
+        _data = File.ReadAllBytes(_path);
+        ReadCrossReferences();
+        if (_trailer.Get("Encrypt") != null) throw new InvalidDataException("暗号化されたPDFは編集できません。");
+        var root = Resolve(_trailer.Get("Root")) as PdfLiteDict;
+        if (root == null) throw new InvalidDataException("PDFの構造を読めません（Rootがありません）。");
+        CollectPages(root.Get("Pages"), new HashSet<int>());
+        if (_pages.Count == 0) throw new InvalidDataException("PDFにページがありません。");
+        _nextObject = _originalSize;
+    }
+
+    public int PageCount { get { return _pages.Count; } }
+
+    /// <summary>Descriptions of the edits now applied, oldest first.</summary>
+    public List<string> History { get { return _history.Take(_applied).Select(step => step.Describe()).ToList(); } }
+
+    public bool CanUndo { get { return _applied > 0; } }
+    public bool CanRedo { get { return _applied < _history.Count; } }
+
+    public double PageWidth(int page) { var box = MediaBox(page); return Math.Abs(box[2] - box[0]); }
+    public double PageHeight(int page) { var box = MediaBox(page); return Math.Abs(box[3] - box[1]); }
+
+    /// <summary>The text of a page as drawn (one line per text block), with the edits applied.</summary>
+    public string PageText(int page)
+    {
+        var builder = new StringBuilder();
+        foreach (var block in TextBlocks(page)) builder.Append(string.Concat(block.Select(piece => piece.Text))).Append('\n');
+        return builder.ToString();
+    }
+
+    /// <summary>How many times a text appears on a page (inside text blocks; a word split over show commands counts).</summary>
+    public int CountText(int page, string text)
+    {
+        if (string.IsNullOrEmpty(text)) return 0;
+        return Matches(string.Concat(TextBlocks(page).SelectMany(block => block).Select(piece => piece.Text)), text).Count;
+    }
+
+    /// <summary>Replaces one occurrence (1 = first on the page) with the letters the page's own font has. Nothing changes when a letter is missing.</summary>
+    public PdfLiteEdit ReplaceText(int page, string find, string replacement, int occurrence)
+    {
+        return Apply(new EditStep { Kind = "text", Page = page, Find = find, Replacement = replacement, Occurrence = occurrence });
+    }
+
+    /// <summary>
+    /// Replaces one occurrence, writing the new text with a Windows font ("gothic" = MS Gothic, "mincho" = MS Mincho) where
+    /// the embedded font lacks letters. The font is referenced, not embedded: show the user a preview before saving.
+    /// </summary>
+    public PdfLiteEdit ReplaceTextWithFont(int page, string find, string replacement, int occurrence, string family)
+    {
+        return Apply(new EditStep { Kind = "text-font", Page = page, Find = find, Replacement = replacement, Occurrence = occurrence, Family = family == "mincho" ? "mincho" : "gothic" });
+    }
+
+    /// <summary>Replaces every occurrence on every page with the fonts' own letters; pages where a letter is missing are left as they were.</summary>
+    public PdfLiteEdit ReplaceAll(string find, string replacement)
+    {
+        var total = 0;
+        var missing = new StringBuilder();
+        for (var page = 1; page <= PageCount; page++)
+            for (var occurrence = CountText(page, find); occurrence >= 1; occurrence--)
+            {
+                var result = ReplaceText(page, find, replacement, occurrence);
+                if (result.Done) total++;
+                else if (!string.IsNullOrEmpty(result.MissingLetters)) missing.Append(result.MissingLetters);
+            }
+        var letters = new string(missing.ToString().Distinct().ToArray());
+        return new PdfLiteEdit { Done = total > 0, Count = total, MissingLetters = letters,
+            Message = total + "か所を置き換えました" + (letters.Length > 0 ? "（フォントにない文字「" + letters + "」を含む箇所は変えていません）" : "") };
+    }
+
+    /// <summary>The rules (thin filled rectangles) of a page, in drawing order.</summary>
+    public List<PdfLiteRule> Rules(int page)
+    {
+        var result = new List<PdfLiteRule>();
+        foreach (var found in FindRules(page, 2.0)) result.Add(found.Rule);
+        return result;
+    }
+
+    /// <summary>Sets the thickness (points) of one rule (index from Rules) or of all rules on the page (index -1).</summary>
+    public PdfLiteEdit SetRuleThickness(int page, int ruleIndex, double points)
+    {
+        return Apply(new EditStep { Kind = "rule-width", Page = page, Index = ruleIndex, Value = points });
+    }
+
+    /// <summary>Moves one rule (index from Rules) by dx, dy points (right and up are positive).</summary>
+    public PdfLiteEdit MoveRule(int page, int ruleIndex, double dx, double dy)
+    {
+        return Apply(new EditStep { Kind = "rule-move", Page = page, Index = ruleIndex, Value = dx, Value2 = dy });
+    }
+
+    /// <summary>Turns a page by a multiple of 90 degrees (clockwise); only the page's rotation entry changes.</summary>
+    public PdfLiteEdit RotatePage(int page, int degrees)
+    {
+        return Apply(new EditStep { Kind = "rotate", Page = page, Index = degrees });
+    }
+
+    /// <summary>The page's rotation in degrees (0, 90, 180 or 270), with the edits applied.</summary>
+    public int PageRotation(int page)
+    {
+        var value = Resolve(PageDict(page).Get("Rotate") ?? Inherited(_pages[page - 1], "Rotate"));
+        return (((int)Number(value) % 360) + 360) % 360;
+    }
+
+    public bool Undo()
+    {
+        if (!CanUndo) return false;
+        _applied--;
+        Replay();
+        return true;
+    }
+
+    public bool Redo()
+    {
+        if (!CanRedo) return false;
+        _applied++;
+        Replay();
+        return true;
+    }
+
+    /// <summary>Writes the original bytes followed by the changes to a new file (never the file that was opened).</summary>
+    public void Save(string outputPath)
+    {
+        var target = Path.GetFullPath(outputPath);
+        if (string.Equals(target, _path, StringComparison.OrdinalIgnoreCase)) throw new IOException("元のPDFには上書きしません。別の名前で保存してください。");
+        using (var output = new MemoryStream())
+        {
+            output.Write(_data, 0, _data.Length);
+            if (_data.Length > 0 && _data[_data.Length - 1] != (byte)'\n') output.WriteByte((byte)'\n');
+            var offsets = new SortedDictionary<int, long>();
+            foreach (var pair in _written.OrderBy(pair => pair.Key))
+            {
+                offsets[pair.Key] = output.Position;
+                Ascii(output, pair.Key + " 0 obj\n");
+                PdfLiteWriter.Write(output, pair.Value);
+                Ascii(output, "\nendobj\n");
+            }
+            var xrefNumber = _nextObject;
+            var xrefOffset = output.Position;
+            offsets[xrefNumber] = xrefOffset;
+            var rows = new MemoryStream();
+            var index = new PdfLiteArray();
+            foreach (var pair in offsets)
+            {
+                rows.WriteByte(1);
+                for (var shift = 24; shift >= 0; shift -= 8) rows.WriteByte((byte)((pair.Value >> shift) & 0xFF));
+                rows.WriteByte(0); rows.WriteByte(0);
+                index.Items.Add(PdfLiteNumber.Of(pair.Key)); index.Items.Add(PdfLiteNumber.Of(1));
+            }
+            var xref = new PdfLiteDict();
+            xref.Set("Type", new PdfLiteName("XRef"));
+            xref.Set("Size", PdfLiteNumber.Of(xrefNumber + 1));
+            xref.Set("Index", index);
+            var widths = new PdfLiteArray();
+            widths.Items.Add(PdfLiteNumber.Of(1)); widths.Items.Add(PdfLiteNumber.Of(4)); widths.Items.Add(PdfLiteNumber.Of(2));
+            xref.Set("W", widths);
+            foreach (var key in new[] { "Root", "Info", "ID" }) if (_trailer.Get(key) != null) xref.Set(key, _trailer.Get(key));
+            xref.Set("Prev", PdfLiteNumber.Of(_lastXref));
+            xref.Stream = rows.ToArray();
+            Ascii(output, xrefNumber + " 0 obj\n");
+            PdfLiteWriter.Write(output, xref);
+            Ascii(output, "\nendobj\nstartxref\n" + xrefOffset + "\n%%EOF\n");
+            File.WriteAllBytes(target, output.ToArray());
+        }
+    }
+
+    // ---- edits ----
+
+    private sealed class EditStep
+    {
+        public string Kind, Find, Replacement, Family;
+        public int Page, Occurrence, Index;
+        public double Value, Value2;
+
+        public string Describe()
+        {
+            if (Kind == "text") return Page + "ページ: 「" + Find + "」→「" + Replacement + "」";
+            if (Kind == "text-font") return Page + "ページ: 「" + Find + "」→「" + Replacement + "」（" + (Family == "mincho" ? "MS明朝" : "MSゴシック") + "で補う）";
+            if (Kind == "rule-width") return Page + "ページ: 罫線" + (Index < 0 ? "すべて" : (Index + 1) + "本目") + "を" + Value.ToString("0.##", CultureInfo.InvariantCulture) + "ptに";
+            if (Kind == "rotate") return Page + "ページを" + Index + "度回転";
+            return Page + "ページ: 罫線" + (Index + 1) + "本目を移動";
+        }
+    }
+
+    private PdfLiteEdit Apply(EditStep step)
+    {
+        if (step.Page < 1 || step.Page > PageCount) return new PdfLiteEdit { Done = false, Page = step.Page, Message = step.Page + "ページはありません。" };
+        var result = Run(step);
+        if (!result.Done)
+        {
+            Replay();
+            return result;
+        }
+        _history.RemoveRange(_applied, _history.Count - _applied);
+        _history.Add(step);
+        _applied = _history.Count;
+        return result;
+    }
+
+    private void Replay()
+    {
+        _pageOps.Clear();
+        _written.Clear();
+        _substituteFonts.Clear();
+        _substituteObjects.Clear();
+        _substituteCodes.Clear();
+        _contentObjects.Clear();
+        _nextObject = _originalSize;
+        for (var i = 0; i < _applied; i++) Run(_history[i]);
+    }
+
+    private PdfLiteEdit Run(EditStep step)
+    {
+        try
+        {
+            if (step.Kind == "text" || step.Kind == "text-font") return RunText(step);
+            if (step.Kind == "rotate")
+            {
+                if (step.Index % 90 != 0) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "回転は90度単位で指定してください。" };
+                var turned = (PageRotation(step.Page) + step.Index % 360 + 360) % 360;
+                WritablePage(step.Page).Set("Rotate", PdfLiteNumber.Of(turned));
+                return new PdfLiteEdit { Done = true, Page = step.Page, Count = 1, Message = step.Describe() + "（" + turned + "度）" };
+            }
+            return RunRule(step);
+        }
+        catch (InvalidDataException ex)
+        {
+            return new PdfLiteEdit { Done = false, Page = step.Page, Message = ex.Message };
+        }
+    }
+
+    private sealed class Piece
+    {
+        public int Op;
+        public int Item;
+        public PdfLiteString Value;
+        public string FontName;
+        public PdfLiteObject FontSize;
+        public FontInfo Font;
+        public string Text;
+    }
+
+    private List<List<Piece>> TextBlocks(int page)
+    {
+        var ops = Ops(page);
+        var fonts = Fonts(page);
+        var blocks = new List<List<Piece>>();
+        var block = new List<Piece>();
+        string fontName = null;
+        PdfLiteObject fontSize = PdfLiteNumber.Of(12);
+        for (var i = 0; i < ops.Count; i++)
+        {
+            var op = ops[i];
+            if (op.Name == "BT") block = new List<Piece>();
+            else if (op.Name == "ET") { if (block.Count > 0) blocks.Add(block); block = new List<Piece>(); }
+            else if (op.Name == "Tf" && op.Operands.Count >= 2 && op.Operands[0] is PdfLiteName) { fontName = ((PdfLiteName)op.Operands[0]).Value; fontSize = op.Operands[1]; }
+            else if ((op.Name == "Tj" || op.Name == "'" || op.Name == "\"") && op.Operands.Count > 0 && op.Operands[op.Operands.Count - 1] is PdfLiteString)
+                block.Add(MakePiece(i, -1, (PdfLiteString)op.Operands[op.Operands.Count - 1], fontName, fontSize, fonts));
+            else if (op.Name == "TJ" && op.Operands.Count > 0 && op.Operands[0] is PdfLiteArray)
+            {
+                var items = ((PdfLiteArray)op.Operands[0]).Items;
+                for (var k = 0; k < items.Count; k++)
+                    if (items[k] is PdfLiteString) block.Add(MakePiece(i, k, (PdfLiteString)items[k], fontName, fontSize, fonts));
+            }
+        }
+        if (block.Count > 0) blocks.Add(block);
+        return blocks;
+    }
+
+    private Piece MakePiece(int op, int item, PdfLiteString value, string fontName, PdfLiteObject fontSize, Dictionary<string, FontInfo> fonts)
+    {
+        FontInfo font = null;
+        if (fontName != null && !fonts.TryGetValue(fontName, out font) && _substituteFonts.ContainsValue(fontName)) font = FontInfo.Utf16;
+        return new Piece { Op = op, Item = item, Value = value, FontName = fontName, FontSize = fontSize, Font = font, Text = font == null ? Encoding.GetEncoding(28591).GetString(value.Bytes) : font.Decode(value.Bytes) };
+    }
+
+    private PdfLiteEdit RunText(EditStep step)
+    {
+        if (string.IsNullOrEmpty(step.Find)) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "置き換える文字が空です。" };
+        // The page's text in drawing order, across text blocks: a heading drawn one letter per block (名簿 2026-10-20) is
+        // still one word, as a reader of the page sees it.
+        var pieces = TextBlocks(step.Page).SelectMany(block => block).ToList();
+        var joined = string.Concat(pieces.Select(piece => piece.Text));
+        var found = Matches(joined, step.Find);
+        var seen = found.Count;
+        if (seen >= Math.Max(1, step.Occurrence))
+        {
+            var span = found[Math.Max(1, step.Occurrence) - 1];
+            var original = joined.Substring(span[0], span[1]);
+            // Spaces drawn inside the word (「摘　要」) stay where they are when the new word has as many letters.
+            var letters = Letters(step.Replacement ?? "").Where(letter => !IsSpace(letter)).ToList();
+            var wanted = step.Replacement ?? "";
+            if (original != step.Find && letters.Count == Letters(original).Count(letter => !IsSpace(letter)))
+            {
+                // Letter by letter, so the spaces between them (drawn in the page's font, which may have no other space) are not rewritten.
+                var originalLetters = Letters(original).ToList();
+                var position = span[0];
+                var next = 0;
+                var changed = new List<int[]>();
+                foreach (var letter in originalLetters)
+                {
+                    if (!IsSpace(letter)) { if (letters[next] != letter) changed.Add(new[] { position, next }); next++; }
+                    position += letter.Length;
+                }
+                PdfLiteEdit last = null;
+                var substituted = false;
+                foreach (var change in changed)
+                {
+                    var single = new EditStep { Kind = step.Kind, Page = step.Page, Find = joined.Substring(change[0], Letters(joined.Substring(change[0])).First().Length), Replacement = letters[change[1]], Family = step.Family };
+                    last = Splice(single, TextBlocks(step.Page).SelectMany(block => block).ToList(), change[0]);
+                    if (!last.Done) return last;
+                    substituted |= last.UsedSubstituteFont;
+                }
+                if (last == null) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "置き換える前と後が同じです。" };
+                last.UsedSubstituteFont = substituted;
+                last.Message = step.Describe() + (substituted ? "（Windowsのフォントで補った文字があります。保存前に見た目を確認してください）" : "");
+                return last;
+            }
+            var exact = new EditStep { Kind = step.Kind, Page = step.Page, Find = original, Replacement = wanted, Occurrence = step.Occurrence, Family = step.Family };
+            var result = Splice(exact, pieces, span[0]);
+            if (result.Done) result.Message = step.Describe() + (result.UsedSubstituteFont ? result.Message.Substring(exact.Describe().Length) : "");
+            return result;
+        }
+        return new PdfLiteEdit { Done = false, Page = step.Page, Message = seen == 0 ? step.Page + "ページに「" + step.Find + "」はありません。" : step.Page + "ページの「" + step.Find + "」は" + seen + "か所です。" };
+    }
+
+    private PdfLiteEdit Splice(EditStep step, List<Piece> block, int at)
+    {
+        // Only the part that really changes is touched: 「１３：３５」→「１３：４０分」 changes 「３５」 into 「４０分」, so the
+        // letters both share keep their own font and place (a whole time drawn in the Windows font looked different, 2026-10-20).
+        var find = step.Find;
+        var newText = step.Replacement ?? "";
+        var same = 0;
+        while (same < find.Length && same < newText.Length && find[same] == newText[same] && !char.IsHighSurrogate(find[same])) same++;
+        var sameEnd = 0;
+        while (sameEnd < find.Length - same && sameEnd < newText.Length - same && find[find.Length - 1 - sameEnd] == newText[newText.Length - 1 - sameEnd] && !char.IsLowSurrogate(find[find.Length - 1 - sameEnd])) sameEnd++;
+        if (same + sameEnd >= find.Length && same + sameEnd >= newText.Length) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "置き換える前と後が同じです。" };
+        at += same;
+        var length = find.Length - same - sameEnd;
+        newText = newText.Substring(same, newText.Length - same - sameEnd);
+        var removed = find.Substring(same, length);
+        if (length == 0)
+        {
+            // Pure insertion: it goes with the letter before it (or after it, at the start).
+            if (same > 0) { at -= 1; length = 1; removed = find.Substring(same - 1, 1); newText = removed + newText; }
+            else { length = 1; removed = find.Substring(0, 1); newText = newText + removed; }
+        }
+        var plans = new List<KeyValuePair<Piece, string[]>>();
+        var offset = 0;
+        var placed = false;
+        foreach (var piece in block)
+        {
+            var start = offset;
+            var end = offset + piece.Text.Length;
+            offset = end;
+            if (end <= at || start >= at + length) continue;
+            if (piece.Font == null) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "文字のフォントが分かりません。" };
+            var from = Math.Max(at, start) - start;
+            var to = Math.Min(at + length, end) - start;
+            plans.Add(new KeyValuePair<Piece, string[]>(piece, new[] { piece.Text.Substring(0, from), placed ? "" : newText, piece.Text.Substring(to) }));
+            placed = true;
+        }
+        if (plans.Count == 0) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "置き換える位置が見つかりません。" };
+        var missing = new StringBuilder();
+        foreach (var plan in plans)
+            foreach (var letter in Letters(plan.Value[0] + plan.Value[1] + plan.Value[2]))
+                if (!plan.Key.Font.CanEncode(letter) && missing.ToString().IndexOf(letter, StringComparison.Ordinal) < 0) missing.Append(letter);
+        var first = plans[0];
+        var growth = first.Key.Font.Width(newText) - first.Key.Font.Width(removed);
+        var size = Number(first.Key.FontSize);
+        if (step.Kind == "text" && missing.Length > 0)
+            return new PdfLiteEdit { Done = false, Page = step.Page, MissingLetters = missing.ToString(),
+                Message = "埋め込まれたフォントに「" + missing + "」がありません。ReplaceTextWithFont でWindowsのフォントを使うと書けます（見た目を確認してください）。" };
+        var ops = Ops(step.Page);
+        var substitute = step.Kind == "text-font" && missing.Length > 0;
+        if (!substitute)
+        {
+            foreach (var plan in plans) plan.Key.Value.Bytes = plan.Key.Font.Encode(plan.Value[0] + plan.Value[1] + plan.Value[2]);
+        }
+        else
+        {
+            // Later pieces only lose letters; the first piece is split so that only the letters its font lacks are drawn
+            // in the Windows font, each run in its own show command.
+            for (var i = plans.Count - 1; i >= 1; i--) plans[i].Key.Value.Bytes = plans[i].Key.Font.Encode(plans[i].Value[0] + plans[i].Value[2]);
+            foreach (var letter in Letters(first.Value[0] + first.Value[2]))
+                if (!first.Key.Font.CanEncode(letter)) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "前後の文字が書けません。" };
+            var target = ops[first.Key.Op];
+            if (target.Name != "Tj" && target.Name != "TJ") return new PdfLiteEdit { Done = false, Page = step.Page, Message = "この文字の命令の形には代替フォントを入れられません。" };
+            var resource = SubstituteFont(step.Page, step.Family);
+            var runs = new List<PdfLiteOp>();
+            var run = new StringBuilder();
+            var runIsOwn = true;
+            growth = -first.Key.Font.Width(removed);
+            foreach (var letter in Letters(newText).Concat(new string[] { null }))
+            {
+                var own = letter != null && first.Key.Font.CanEncode(letter);
+                if (run.Length > 0 && (letter == null || own != runIsOwn))
+                {
+                    if (runIsOwn)
+                    {
+                        runs.Add(new PdfLiteOp("Tj", new PdfLiteString { Bytes = first.Key.Font.Encode(run.ToString()), Hex = true }));
+                        growth += first.Key.Font.Width(run.ToString());
+                    }
+                    else
+                    {
+                        var code = Encoding.BigEndianUnicode.GetBytes(run.ToString());
+                        foreach (var unit in run.ToString()) _substituteCodes[step.Family].Add(unit);
+                        AddSubstituteShow(runs, resource, first.Key, code);
+                        growth += run.Length * 1000.0;
+                    }
+                    run.Clear();
+                }
+                if (letter == null) break;
+                runIsOwn = own;
+                run.Append(letter);
+            }
+            WriteSubstituteToUnicode(step.Family);
+            var replacement = new List<PdfLiteOp>();
+            var before = new PdfLiteString { Bytes = first.Key.Font.Encode(first.Value[0]), Hex = true };
+            var after = new PdfLiteString { Bytes = first.Key.Font.Encode(first.Value[2]), Hex = true };
+            if (target.Name == "TJ")
+            {
+                var items = ((PdfLiteArray)target.Operands[0]).Items;
+                var head = new PdfLiteArray(); head.Items.AddRange(items.Take(first.Key.Item)); if (before.Bytes.Length > 0) head.Items.Add(before);
+                var tail = new PdfLiteArray(); if (after.Bytes.Length > 0) tail.Items.Add(after); tail.Items.AddRange(items.Skip(first.Key.Item + 1));
+                if (head.Items.Count > 0) replacement.Add(new PdfLiteOp("TJ", head));
+                replacement.AddRange(runs);
+                if (tail.Items.Count > 0) replacement.Add(new PdfLiteOp("TJ", tail));
+            }
+            else
+            {
+                if (before.Bytes.Length > 0) replacement.Add(new PdfLiteOp("Tj", before));
+                replacement.AddRange(runs);
+                if (after.Bytes.Length > 0) replacement.Add(new PdfLiteOp("Tj", after));
+            }
+            ops.RemoveAt(first.Key.Op);
+            ops.InsertRange(first.Key.Op, replacement);
+        }
+        WriteContent(step.Page);
+        return new PdfLiteEdit { Done = true, Page = step.Page, UsedSubstituteFont = substitute, GrowthPoints = Math.Round(growth / 1000.0 * size, 2),
+            Message = step.Describe() + (substitute ? "（「" + missing + "」はWindowsのフォントで表示されます。保存前に見た目を確認してください）" : "") };
+    }
+    private void AddSubstituteShow(List<PdfLiteOp> ops, string resource, Piece piece, byte[] code)
+    {
+        ops.Add(new PdfLiteOp("Tf", new PdfLiteName(resource), piece.FontSize));
+        ops.Add(new PdfLiteOp("Tj", new PdfLiteString { Bytes = code, Hex = true }));
+        ops.Add(new PdfLiteOp("Tf", new PdfLiteName(piece.FontName), piece.FontSize));
+    }
+
+    private static bool IsSpace(string letter)
+    {
+        return letter.Length == 1 && char.IsWhiteSpace(letter[0]);
+    }
+
+    /// <summary>Where a word appears (start, length), ignoring spaces drawn between its letters, as a reader would.</summary>
+    private static List<int[]> Matches(string text, string word)
+    {
+        var result = new List<int[]>();
+        var wanted = new string((word ?? "").Where(ch => !char.IsWhiteSpace(ch)).ToArray());
+        if (wanted.Length == 0) return result;
+        var positions = new List<int>();
+        var plain = new StringBuilder();
+        for (var i = 0; i < text.Length; i++) if (!char.IsWhiteSpace(text[i])) { positions.Add(i); plain.Append(text[i]); }
+        var flat = plain.ToString();
+        for (var at = flat.IndexOf(wanted, StringComparison.Ordinal); at >= 0; at = flat.IndexOf(wanted, at + wanted.Length, StringComparison.Ordinal))
+        {
+            var start = positions[at];
+            var end = positions[at + wanted.Length - 1] + 1;
+            result.Add(new[] { start, end - start });
+        }
+        return result;
+    }
+
+    private static IEnumerable<string> Letters(string text)
+    {
+        for (var i = 0; i < text.Length; i++)
+        {
+            if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length) { yield return text.Substring(i, 2); i++; }
+            else yield return text[i].ToString();
+        }
+    }
+
+    private sealed class FoundRule
+    {
+        public PdfLiteRule Rule;
+        public PdfLiteOp Op;
+        public double[] Matrix;
+    }
+
+    private List<FoundRule> FindRules(int page, double maxThickness)
+    {
+        var result = new List<FoundRule>();
+        var stack = new Stack<double[]>();
+        var matrix = new double[] { 1, 0, 0, 1, 0, 0 };
+        foreach (var op in Ops(page))
+        {
+            if (op.Name == "q") stack.Push((double[])matrix.Clone());
+            else if (op.Name == "Q") { if (stack.Count > 0) matrix = stack.Pop(); }
+            else if (op.Name == "cm" && op.Operands.Count == 6) matrix = Multiply(op.Operands.Select(Number).ToArray(), matrix);
+            else if (op.Name == "re" && op.Operands.Count == 4)
+            {
+                var v = op.Operands.Select(Number).ToArray();
+                var xs = new List<double>(); var ys = new List<double>();
+                foreach (var corner in new[] { new[] { v[0], v[1] }, new[] { v[0] + v[2], v[1] }, new[] { v[0], v[1] + v[3] }, new[] { v[0] + v[2], v[1] + v[3] } })
+                {
+                    xs.Add(matrix[0] * corner[0] + matrix[2] * corner[1] + matrix[4]);
+                    ys.Add(matrix[1] * corner[0] + matrix[3] * corner[1] + matrix[5]);
+                }
+                double width = xs.Max() - xs.Min(), height = ys.Max() - ys.Min();
+                var horizontal = height <= maxThickness && width > height * 4;
+                var vertical = width <= maxThickness && height > width * 4;
+                if (!horizontal && !vertical) continue;
+                result.Add(new FoundRule { Op = op, Matrix = (double[])matrix.Clone(), Rule = new PdfLiteRule { Index = result.Count, Horizontal = horizontal,
+                    Left = Math.Round(xs.Min(), 3), Bottom = Math.Round(ys.Min(), 3), Width = Math.Round(width, 3), Height = Math.Round(height, 3), Thickness = Math.Round(horizontal ? height : width, 3) } });
+            }
+        }
+        return result;
+    }
+
+    private PdfLiteEdit RunRule(EditStep step)
+    {
+        var rules = FindRules(step.Page, 2.0);
+        if (rules.Count == 0) return new PdfLiteEdit { Done = false, Page = step.Page, Message = step.Page + "ページに罫線（細い長方形）が見つかりません。" };
+        if (step.Index >= rules.Count || (step.Index < 0 && step.Kind == "rule-move")) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "罫線は" + rules.Count + "本です。" };
+        var chosen = step.Index < 0 ? rules : new List<FoundRule> { rules[step.Index] };
+        foreach (var found in chosen)
+        {
+            var v = found.Op.Operands.Select(Number).ToArray();
+            var m = found.Matrix;
+            var sx = Math.Sqrt(m[0] * m[0] + m[1] * m[1]);
+            var sy = Math.Sqrt(m[2] * m[2] + m[3] * m[3]);
+            if (step.Kind == "rule-width")
+            {
+                if (step.Value <= 0 || step.Value > 20) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "線の太さは0より大きく20pt以下にしてください。" };
+                if (found.Rule.Horizontal) { var h = Math.Sign(v[3] == 0 ? 1 : v[3]) * step.Value / sy; v[1] += (v[3] - h) / 2; v[3] = h; }
+                else { var w = Math.Sign(v[2] == 0 ? 1 : v[2]) * step.Value / sx; v[0] += (v[2] - w) / 2; v[2] = w; }
+            }
+            else
+            {
+                // Page distance back to the rectangle's own units (the inverse of the drawing's scale and rotation).
+                var det = m[0] * m[3] - m[1] * m[2];
+                if (Math.Abs(det) < 1e-12) return new PdfLiteEdit { Done = false, Page = step.Page, Message = "この罫線は動かせません。" };
+                v[0] += (m[3] * step.Value - m[2] * step.Value2) / det;
+                v[1] += (-m[1] * step.Value + m[0] * step.Value2) / det;
+            }
+            found.Op.Operands.Clear();
+            foreach (var value in v) found.Op.Operands.Add(PdfLiteNumber.Of(Math.Round(value, 4)));
+        }
+        WriteContent(step.Page);
+        return new PdfLiteEdit { Done = true, Page = step.Page, Count = chosen.Count, Message = step.Describe() + "（" + chosen.Count + "本）" };
+    }
+
+    // ---- page content and fonts ----
+
+    private List<PdfLiteOp> Ops(int page)
+    {
+        List<PdfLiteOp> ops;
+        if (_pageOps.TryGetValue(page, out ops)) return ops;
+        var dict = PageDict(page);
+        var contents = Resolve(dict.Get("Contents"));
+        var parts = new List<PdfLiteObject>();
+        if (contents is PdfLiteArray) parts.AddRange(((PdfLiteArray)contents).Items.Select(Resolve));
+        else if (contents != null) parts.Add(contents);
+        var all = new MemoryStream();
+        foreach (var part in parts)
+        {
+            var stream = part as PdfLiteDict;
+            if (stream == null || stream.Stream == null) continue;
+            var bytes = Decode(stream);
+            all.Write(bytes, 0, bytes.Length);
+            all.WriteByte((byte)'\n');
+        }
+        ops = new PdfLiteParser(all.ToArray(), null).ReadContent();
+        _pageOps[page] = ops;
+        return ops;
+    }
+
+    private void WriteContent(int page)
+    {
+        var plain = new MemoryStream();
+        foreach (var op in Ops(page)) { PdfLiteWriter.WriteOp(plain, op); plain.WriteByte((byte)'\n'); }
+        var stream = new PdfLiteDict();
+        stream.Set("Filter", new PdfLiteName("FlateDecode"));
+        stream.Stream = Deflate(plain.ToArray());
+        int number;
+        if (!_contentObjects.TryGetValue(page, out number)) { number = _nextObject++; _contentObjects[page] = number; }
+        _written[number] = stream;
+        var dict = WritablePage(page);
+        dict.Set("Contents", new PdfLiteRef(number, 0));
+    }
+
+    private readonly Dictionary<int, int> _contentObjects = new Dictionary<int, int>();
+
+    private PdfLiteDict WritablePage(int page)
+    {
+        var number = _pages[page - 1];
+        PdfLiteObject current;
+        if (_written.TryGetValue(number, out current)) return (PdfLiteDict)current;
+        var copy = ((PdfLiteDict)GetObject(number)).ShallowCopy();
+        // Inherited values become the page's own, so a changed page does not depend on its parent for them.
+        foreach (var key in new[] { "Resources", "MediaBox", "Rotate" })
+            if (copy.Get(key) == null) { var inherited = Inherited(number, key); if (inherited != null) copy.Set(key, inherited); }
+        _written[number] = copy;
+        return copy;
+    }
+
+    private string SubstituteFont(int page, string family)
+    {
+        string name;
+        if (_substituteFonts.TryGetValue(page * 10 + (family == "mincho" ? 1 : 0), out name)) return name;
+        int[] objects;
+        if (!_substituteObjects.TryGetValue(family, out objects))
+        {
+            objects = new[] { _nextObject++, _nextObject++, _nextObject++, _nextObject++ };
+            _substituteObjects[family] = objects;
+            _substituteCodes[family] = new SortedSet<int>();
+            var baseFont = family == "mincho" ? "MS-Mincho" : "MS-Gothic";
+            var descriptor = new PdfLiteDict();
+            descriptor.Set("Type", new PdfLiteName("FontDescriptor"));
+            descriptor.Set("FontName", new PdfLiteName(baseFont));
+            descriptor.Set("Flags", PdfLiteNumber.Of(family == "mincho" ? 6 : 4));
+            descriptor.Set("FontBBox", Numbers(0, -141, 1000, 859));
+            descriptor.Set("ItalicAngle", PdfLiteNumber.Of(0));
+            descriptor.Set("Ascent", PdfLiteNumber.Of(859));
+            descriptor.Set("Descent", PdfLiteNumber.Of(-141));
+            descriptor.Set("CapHeight", PdfLiteNumber.Of(769));
+            descriptor.Set("StemV", PdfLiteNumber.Of(80));
+            var info = new PdfLiteDict();
+            info.Set("Registry", new PdfLiteString { Bytes = Encoding.ASCII.GetBytes("Adobe") });
+            info.Set("Ordering", new PdfLiteString { Bytes = Encoding.ASCII.GetBytes("Japan1") });
+            info.Set("Supplement", PdfLiteNumber.Of(6));
+            var cid = new PdfLiteDict();
+            cid.Set("Type", new PdfLiteName("Font"));
+            cid.Set("Subtype", new PdfLiteName("CIDFontType0"));
+            cid.Set("BaseFont", new PdfLiteName(baseFont));
+            cid.Set("CIDSystemInfo", info);
+            cid.Set("FontDescriptor", new PdfLiteRef(objects[2], 0));
+            cid.Set("DW", PdfLiteNumber.Of(1000));
+            var font = new PdfLiteDict();
+            font.Set("Type", new PdfLiteName("Font"));
+            font.Set("Subtype", new PdfLiteName("Type0"));
+            font.Set("BaseFont", new PdfLiteName(baseFont));
+            font.Set("Encoding", new PdfLiteName("UniJIS-UTF16-H"));
+            var descendants = new PdfLiteArray(); descendants.Items.Add(new PdfLiteRef(objects[1], 0));
+            font.Set("DescendantFonts", descendants);
+            font.Set("ToUnicode", new PdfLiteRef(objects[3], 0));
+            _written[objects[0]] = font;
+            _written[objects[1]] = cid;
+            _written[objects[2]] = descriptor;
+        }
+        var dict = WritablePage(page);
+        var resources = (Resolve(dict.Get("Resources")) as PdfLiteDict ?? new PdfLiteDict()).ShallowCopy();
+        var fonts = (Resolve(resources.Get("Font")) as PdfLiteDict ?? new PdfLiteDict()).ShallowCopy();
+        name = family == "mincho" ? "LSMincho" : "LSGothic";
+        while (fonts.Get(name) != null) name += "X";
+        fonts.Set(name, new PdfLiteRef(objects[0], 0));
+        resources.Set("Font", fonts);
+        dict.Set("Resources", resources);
+        _substituteFonts[page * 10 + (family == "mincho" ? 1 : 0)] = name;
+        return name;
+    }
+
+    private void WriteSubstituteToUnicode(string family)
+    {
+        var map = new StringBuilder();
+        map.Append("/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n/CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n");
+        var codes = _substituteCodes[family].ToList();
+        for (var start = 0; start < codes.Count; start += 100)
+        {
+            var chunk = codes.Skip(start).Take(100).ToList();
+            map.Append(chunk.Count).Append(" beginbfchar\n");
+            foreach (var code in chunk) map.Append('<').Append(code.ToString("X4")).Append("> <").Append(code.ToString("X4")).Append(">\n");
+            map.Append("endbfchar\n");
+        }
+        map.Append("endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n");
+        var stream = new PdfLiteDict();
+        stream.Stream = Encoding.ASCII.GetBytes(map.ToString());
+        _written[_substituteObjects[family][3]] = stream;
+    }
+
+    internal sealed class FontInfo
+    {
+        public bool TwoByte;
+        public Dictionary<int, string> ToUnicode = new Dictionary<int, string>();
+        public Dictionary<string, int> Codes = new Dictionary<string, int>();
+        public Dictionary<int, double> Widths = new Dictionary<int, double>();
+        public double DefaultWidth = 1000;
+        public bool Latin;
+        /// <summary>The Windows font added for missing letters: codes are UTF-16.</summary>
+        public bool Unicode;
+        public static readonly FontInfo Utf16 = new FontInfo { TwoByte = true, Unicode = true };
+
+        public string Decode(byte[] bytes)
+        {
+            if (Unicode) return Encoding.BigEndianUnicode.GetString(bytes);
+            var builder = new StringBuilder();
+            if (TwoByte)
+            {
+                for (var i = 0; i + 1 < bytes.Length; i += 2)
+                {
+                    string text;
+                    builder.Append(ToUnicode.TryGetValue((bytes[i] << 8) | bytes[i + 1], out text) ? text : "\uFFFD");
+                }
+            }
+            else
+                foreach (var b in bytes) { string text; builder.Append(ToUnicode.TryGetValue(b, out text) ? text : Latin ? ((char)b).ToString() : "\uFFFD"); }
+            return builder.ToString();
+        }
+
+        public bool CanEncode(string letter)
+        {
+            return Unicode || Codes.ContainsKey(letter) || (!TwoByte && Latin && letter.Length == 1 && letter[0] < 256);
+        }
+
+        public byte[] Encode(string text)
+        {
+            if (Unicode) return Encoding.BigEndianUnicode.GetBytes(text);
+            var bytes = new List<byte>();
+            foreach (var letter in Letters(text))
+            {
+                int code;
+                if (!Codes.TryGetValue(letter, out code))
+                {
+                    if (!TwoByte && Latin && letter.Length == 1 && letter[0] < 256) code = letter[0];
+                    else throw new InvalidDataException("フォントに「" + letter + "」がありません。");
+                }
+                if (TwoByte) bytes.Add((byte)(code >> 8));
+                bytes.Add((byte)(code & 0xFF));
+            }
+            return bytes.ToArray();
+        }
+
+        public double Width(string text)
+        {
+            double total = 0;
+            foreach (var letter in Letters(text))
+            {
+                int code;
+                double width;
+                total += Codes.TryGetValue(letter, out code) && Widths.TryGetValue(code, out width) ? width : DefaultWidth;
+            }
+            return total;
+        }
+    }
+
+    private readonly Dictionary<int, Dictionary<string, FontInfo>> _fonts = new Dictionary<int, Dictionary<string, FontInfo>>();
+
+    private Dictionary<string, FontInfo> Fonts(int page)
+    {
+        Dictionary<string, FontInfo> result;
+        if (_fonts.TryGetValue(page, out result)) return result;
+        result = new Dictionary<string, FontInfo>();
+        var resources = Resolve(PageDict(page).Get("Resources") ?? Inherited(_pages[page - 1], "Resources")) as PdfLiteDict;
+        var fontDict = resources == null ? null : Resolve(resources.Get("Font")) as PdfLiteDict;
+        if (fontDict != null)
+            foreach (var pair in fontDict.Items)
+            {
+                var font = Resolve(pair.Value) as PdfLiteDict;
+                if (font != null) result[pair.Key] = ReadFont(font);
+            }
+        _fonts[page] = result;
+        return result;
+    }
+
+    private FontInfo ReadFont(PdfLiteDict font)
+    {
+        var info = new FontInfo();
+        var subtype = NameOf(font.Get("Subtype"));
+        info.TwoByte = subtype == "Type0";
+        var encoding = NameOf(Resolve(font.Get("Encoding")));
+        info.Latin = !info.TwoByte && (encoding == "WinAnsiEncoding" || encoding == "StandardEncoding" || encoding == "");
+        var toUnicode = Resolve(font.Get("ToUnicode")) as PdfLiteDict;
+        if (toUnicode != null && toUnicode.Stream != null) ReadCMap(Encoding.GetEncoding(28591).GetString(Decode(toUnicode)), info.ToUnicode);
+        foreach (var pair in info.ToUnicode) if (!info.Codes.ContainsKey(pair.Value)) info.Codes[pair.Value] = pair.Key;
+        if (info.TwoByte)
+        {
+            var descendants = Resolve(font.Get("DescendantFonts")) as PdfLiteArray;
+            var cid = descendants != null && descendants.Items.Count > 0 ? Resolve(descendants.Items[0]) as PdfLiteDict : null;
+            if (cid != null)
+            {
+                if (cid.Get("DW") != null) info.DefaultWidth = Number(Resolve(cid.Get("DW")));
+                var w = Resolve(cid.Get("W")) as PdfLiteArray;
+                if (w != null)
+                    for (var i = 0; i + 1 < w.Items.Count;)
+                    {
+                        var first = (int)Number(Resolve(w.Items[i]));
+                        var next = Resolve(w.Items[i + 1]);
+                        if (next is PdfLiteArray)
+                        {
+                            var list = ((PdfLiteArray)next).Items;
+                            for (var k = 0; k < list.Count; k++) info.Widths[first + k] = Number(Resolve(list[k]));
+                            i += 2;
+                        }
+                        else if (i + 2 < w.Items.Count)
+                        {
+                            var last = (int)Number(next);
+                            var width = Number(Resolve(w.Items[i + 2]));
+                            for (var code = first; code <= last && code - first < 65536; code++) info.Widths[code] = width;
+                            i += 3;
+                        }
+                        else break;
+                    }
+            }
+            // Identity-H: the code is the glyph's CID, so the font has every letter its ToUnicode lists and no other.
+            if (encoding != "Identity-H" && encoding != "Identity-V") info.Codes.Clear();
+        }
+        else
+        {
+            var widths = Resolve(font.Get("Widths")) as PdfLiteArray;
+            var firstChar = font.Get("FirstChar") == null ? 0 : (int)Number(Resolve(font.Get("FirstChar")));
+            if (widths != null) for (var k = 0; k < widths.Items.Count; k++) info.Widths[firstChar + k] = Number(Resolve(widths.Items[k]));
+            info.DefaultWidth = 500;
+        }
+        return info;
+    }
+
+    private static void ReadCMap(string text, Dictionary<int, string> map)
+    {
+        foreach (Match block in Regex.Matches(text, @"beginbfchar(?<body>.*?)endbfchar", RegexOptions.Singleline))
+            foreach (Match pair in Regex.Matches(block.Groups["body"].Value, @"<(?<code>[0-9A-Fa-f]+)>\s*<(?<text>[0-9A-Fa-f]*)>"))
+                map[int.Parse(pair.Groups["code"].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture)] = HexText(pair.Groups["text"].Value);
+        foreach (Match block in Regex.Matches(text, @"beginbfrange(?<body>.*?)endbfrange", RegexOptions.Singleline))
+            foreach (Match range in Regex.Matches(block.Groups["body"].Value, @"<(?<lo>[0-9A-Fa-f]+)>\s*<(?<hi>[0-9A-Fa-f]+)>\s*(?:<(?<start>[0-9A-Fa-f]+)>|\[(?<list>[^\]]*)\])"))
+            {
+                var lo = int.Parse(range.Groups["lo"].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+                var hi = Math.Min(int.Parse(range.Groups["hi"].Value, NumberStyles.HexNumber, CultureInfo.InvariantCulture), lo + 65535);
+                if (range.Groups["start"].Success)
+                {
+                    var start = HexText(range.Groups["start"].Value);
+                    if (start.Length == 0) continue;
+                    for (var code = lo; code <= hi; code++) map[code] = start.Substring(0, start.Length - 1) + (char)(start[start.Length - 1] + (code - lo));
+                }
+                else
+                {
+                    var items = Regex.Matches(range.Groups["list"].Value, @"<([0-9A-Fa-f]*)>").Cast<Match>().Select(item => HexText(item.Groups[1].Value)).ToArray();
+                    for (var i = 0; i < items.Length && lo + i <= hi; i++) map[lo + i] = items[i];
+                }
+            }
+    }
+
+    private static string HexText(string hex)
+    {
+        var builder = new StringBuilder();
+        for (var i = 0; i + 4 <= hex.Length; i += 4) builder.Append((char)int.Parse(hex.Substring(i, 4), NumberStyles.HexNumber, CultureInfo.InvariantCulture));
+        return builder.ToString();
+    }
+
+    // ---- document structure ----
+
+    private PdfLiteDict PageDict(int page)
+    {
+        PdfLiteObject written;
+        if (_written.TryGetValue(_pages[page - 1], out written)) return (PdfLiteDict)written;
+        return (PdfLiteDict)GetObject(_pages[page - 1]);
+    }
+
+    private readonly Dictionary<int, int> _parents = new Dictionary<int, int>();
+
+    private void CollectPages(PdfLiteObject node, HashSet<int> seen)
+    {
+        var reference = node as PdfLiteRef;
+        if (reference == null || !seen.Add(reference.Number) || seen.Count > 100000) return;
+        var dict = GetObject(reference.Number) as PdfLiteDict;
+        if (dict == null) return;
+        var kids = Resolve(dict.Get("Kids")) as PdfLiteArray;
+        if (NameOf(dict.Get("Type")) == "Pages" || (kids != null && NameOf(dict.Get("Type")) != "Page"))
+        {
+            if (kids == null) return;
+            foreach (var kid in kids.Items)
+            {
+                var kidRef = kid as PdfLiteRef;
+                if (kidRef != null) _parents[kidRef.Number] = reference.Number;
+                CollectPages(kid, seen);
+            }
+        }
+        else _pages.Add(reference.Number);
+    }
+
+    private PdfLiteObject Inherited(int number, string key)
+    {
+        int parent;
+        for (var guard = 0; _parents.TryGetValue(number, out parent) && guard < 64; guard++)
+        {
+            var dict = GetObject(parent) as PdfLiteDict;
+            if (dict != null && dict.Get(key) != null) return dict.Get(key);
+            number = parent;
+        }
+        return null;
+    }
+
+    private double[] MediaBox(int page)
+    {
+        var box = Resolve(PageDict(page).Get("MediaBox") ?? Inherited(_pages[page - 1], "MediaBox")) as PdfLiteArray;
+        if (box == null || box.Items.Count != 4) return new double[] { 0, 0, 595, 842 };
+        return box.Items.Select(item => Number(Resolve(item))).ToArray();
+    }
+
+    internal PdfLiteObject Resolve(PdfLiteObject value)
+    {
+        var reference = value as PdfLiteRef;
+        return reference == null ? value : GetObject(reference.Number);
+    }
+
+    private PdfLiteObject GetObject(int number)
+    {
+        PdfLiteObject cached;
+        if (_cache.TryGetValue(number, out cached)) return cached;
+        long[] entry;
+        PdfLiteObject result = null;
+        if (_xref.TryGetValue(number, out entry))
+        {
+            if (entry[0] == 1)
+            {
+                var parser = new PdfLiteParser(_data, this) { Position = (int)entry[1] };
+                parser.ReadInteger(); parser.ReadInteger();
+                parser.Expect("obj");
+                _cache[number] = null; // guards a stream /Length that points back here
+                result = parser.ReadObject();
+            }
+            else if (entry[0] == 2) result = FromObjectStream((int)entry[1], number);
+        }
+        _cache[number] = result;
+        return result;
+    }
+
+    private PdfLiteObject FromObjectStream(int streamNumber, int number)
+    {
+        byte[] data;
+        List<KeyValuePair<int, int>> offsets;
+        if (!_objectStreams.TryGetValue(streamNumber, out offsets))
+        {
+            var stream = GetObject(streamNumber) as PdfLiteDict;
+            if (stream == null || stream.Stream == null) return null;
+            data = Decode(stream);
+            var count = (int)Number(Resolve(stream.Get("N")));
+            var first = (int)Number(Resolve(stream.Get("First")));
+            var header = new PdfLiteParser(data, this);
+            offsets = new List<KeyValuePair<int, int>>();
+            for (var i = 0; i < count; i++) { var objectNumber = header.ReadInteger(); var offset = header.ReadInteger(); offsets.Add(new KeyValuePair<int, int>(objectNumber, first + offset)); }
+            _objectStreams[streamNumber] = offsets;
+            _objectStreamData[streamNumber] = data;
+        }
+        data = _objectStreamData[streamNumber];
+        foreach (var pair in offsets)
+            if (pair.Key == number) return new PdfLiteParser(data, this) { Position = pair.Value }.ReadObject();
+        return null;
+    }
+
+    private void ReadCrossReferences()
+    {
+        var tail = Encoding.GetEncoding(28591).GetString(_data, Math.Max(0, _data.Length - 2048), Math.Min(2048, _data.Length));
+        var match = Regex.Match(tail, @"startxref\s+(\d+)", RegexOptions.RightToLeft);
+        if (!match.Success) throw new InvalidDataException("PDFの終わりが読めません（startxrefがありません）。");
+        _lastXref = long.Parse(match.Groups[1].Value, CultureInfo.InvariantCulture);
+        var seen = new HashSet<long>();
+        long position = _lastXref;
+        while (position >= 0 && position < _data.Length && seen.Add(position))
+        {
+            PdfLiteDict trailer;
+            var parser = new PdfLiteParser(_data, this) { Position = (int)position };
+            parser.SkipSpace();
+            if (parser.PeekKeyword("xref"))
+            {
+                parser.Expect("xref");
+                while (true)
+                {
+                    parser.SkipSpace();
+                    if (parser.PeekKeyword("trailer")) { parser.Expect("trailer"); break; }
+                    var start = parser.ReadInteger();
+                    var count = parser.ReadInteger();
+                    for (var i = 0; i < count; i++)
+                    {
+                        var offset = parser.ReadLong();
+                        parser.ReadInteger();
+                        var kind = parser.ReadKeyword();
+                        if (!_xref.ContainsKey(start + i)) _xref[start + i] = kind == "n" ? new long[] { 1, offset } : new long[] { 0, 0 };
+                    }
+                }
+                trailer = (PdfLiteDict)parser.ReadObject();
+                if (trailer.Get("XRefStm") != null) ReadXrefStream((long)Number(trailer.Get("XRefStm")));
+            }
+            else trailer = ReadXrefStream(position);
+            if (_trailer == null) _trailer = trailer;
+            _originalSize = Math.Max(_originalSize, (int)Number(trailer.Get("Size")));
+            position = trailer.Get("Prev") == null ? -1 : (long)Number(trailer.Get("Prev"));
+        }
+        if (_trailer == null) throw new InvalidDataException("PDFの目次（相互参照）が読めません。");
+    }
+
+    private PdfLiteDict ReadXrefStream(long position)
+    {
+        var parser = new PdfLiteParser(_data, this) { Position = (int)position };
+        parser.ReadInteger(); parser.ReadInteger(); parser.Expect("obj");
+        var stream = parser.ReadObject() as PdfLiteDict;
+        if (stream == null || stream.Stream == null || NameOf(stream.Get("Type")) != "XRef") throw new InvalidDataException("PDFの目次（相互参照）が読めません。");
+        var rows = Decode(stream);
+        var w = ((PdfLiteArray)stream.Get("W")).Items.Select(item => (int)Number(item)).ToArray();
+        var index = stream.Get("Index") as PdfLiteArray;
+        var ranges = index == null ? new[] { 0, (int)Number(stream.Get("Size")) } : index.Items.Select(item => (int)Number(item)).ToArray();
+        var at = 0;
+        for (var r = 0; r + 1 < ranges.Length; r += 2)
+            for (var i = 0; i < ranges[r + 1] && at + w.Sum() <= rows.Length; i++)
+            {
+                var fields = new long[3];
+                for (var f = 0; f < 3; f++)
+                {
+                    long value = 0;
+                    for (var b = 0; b < w[f]; b++) value = (value << 8) | rows[at++];
+                    fields[f] = w[f] == 0 && f == 0 ? 1 : value;
+                }
+                if (!_xref.ContainsKey(ranges[r] + i)) _xref[ranges[r] + i] = new long[] { fields[0], fields[1] };
+            }
+        return stream;
+    }
+
+    internal byte[] Decode(PdfLiteDict stream)
+    {
+        var data = stream.Stream;
+        var filter = Resolve(stream.Get("Filter"));
+        var filters = filter is PdfLiteArray ? ((PdfLiteArray)filter).Items.Select(item => NameOf(Resolve(item))).ToList() : filter == null ? new List<string>() : new List<string> { NameOf(filter) };
+        var parms = Resolve(stream.Get("DecodeParms"));
+        for (var i = 0; i < filters.Count; i++)
+        {
+            if (filters[i] != "FlateDecode") throw new InvalidDataException("このPDFの圧縮形式（" + filters[i] + "）は扱えません。");
+            data = Inflate(data);
+            var parm = parms is PdfLiteArray ? Resolve(((PdfLiteArray)parms).Items[i]) as PdfLiteDict : parms as PdfLiteDict;
+            if (parm != null && parm.Get("Predictor") != null && Number(parm.Get("Predictor")) >= 10)
+                data = Unpredict(data, parm.Get("Columns") == null ? 1 : (int)Number(parm.Get("Columns")));
+        }
+        return data;
+    }
+
+    private static byte[] Inflate(byte[] data)
+    {
+        using (var input = new MemoryStream(data, 2, Math.Max(0, data.Length - 2)))
+        using (var inflate = new DeflateStream(input, CompressionMode.Decompress))
+        using (var output = new MemoryStream())
+        {
+            try { inflate.CopyTo(output); }
+            catch (InvalidDataException) { if (output.Length == 0) throw; }
+            return output.ToArray();
+        }
+    }
+
+    private static byte[] Deflate(byte[] data)
+    {
+        using (var output = new MemoryStream())
+        {
+            output.WriteByte(0x78); output.WriteByte(0x9C);
+            using (var deflate = new DeflateStream(output, CompressionMode.Compress, true)) deflate.Write(data, 0, data.Length);
+            uint a = 1, b = 0;
+            foreach (var value in data) { a = (a + value) % 65521; b = (b + a) % 65521; }
+            var adler = (b << 16) | a;
+            for (var shift = 24; shift >= 0; shift -= 8) output.WriteByte((byte)((adler >> shift) & 0xFF));
+            return output.ToArray();
+        }
+    }
+
+    private static byte[] Unpredict(byte[] data, int columns)
+    {
+        var output = new List<byte>();
+        var previous = new byte[columns];
+        for (var row = 0; row * (columns + 1) < data.Length; row++)
+        {
+            var type = data[row * (columns + 1)];
+            var line = new byte[columns];
+            for (var i = 0; i < columns && row * (columns + 1) + 1 + i < data.Length; i++)
+            {
+                var raw = data[row * (columns + 1) + 1 + i];
+                var left = i > 0 ? line[i - 1] : (byte)0;
+                var up = previous[i];
+                var upLeft = i > 0 ? previous[i - 1] : (byte)0;
+                int value = raw;
+                if (type == 1) value += left;
+                else if (type == 2) value += up;
+                else if (type == 3) value += (left + up) / 2;
+                else if (type == 4) { var p = left + up - upLeft; var pa = Math.Abs(p - left); var pb = Math.Abs(p - up); var pc = Math.Abs(p - upLeft); value += pa <= pb && pa <= pc ? left : pb <= pc ? up : upLeft; }
+                line[i] = (byte)(value & 0xFF);
+            }
+            output.AddRange(line);
+            previous = line;
+        }
+        return output.ToArray();
+    }
+
+    // ---- small helpers ----
+
+    internal static double Number(PdfLiteObject value)
+    {
+        var number = value as PdfLiteNumber;
+        return number == null ? 0 : number.Value;
+    }
+
+    private static string NameOf(PdfLiteObject value)
+    {
+        var name = value as PdfLiteName;
+        return name == null ? "" : name.Value;
+    }
+
+    private static PdfLiteArray Numbers(params double[] values)
+    {
+        var array = new PdfLiteArray();
+        foreach (var value in values) array.Items.Add(PdfLiteNumber.Of(value));
+        return array;
+    }
+
+    private static double[] Multiply(double[] m, double[] n)
+    {
+        return new[]
+        {
+            m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
+            m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
+            m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]
+        };
+    }
+
+    private static int Occurrences(string text, string word)
+    {
+        var count = 0;
+        for (var at = text.IndexOf(word, StringComparison.Ordinal); at >= 0; at = text.IndexOf(word, at + word.Length, StringComparison.Ordinal)) count++;
+        return count;
+    }
+
+    private static void Ascii(Stream output, string text)
+    {
+        var bytes = Encoding.ASCII.GetBytes(text);
+        output.Write(bytes, 0, bytes.Length);
+    }
+}
+
+// ---- PDF objects, parser and writer ----
+
+public abstract class PdfLiteObject { }
+
+public sealed class PdfLiteNumber : PdfLiteObject
+{
+    public double Value;
+    public string Raw;
+
+    public static PdfLiteNumber Of(double value)
+    {
+        return new PdfLiteNumber { Value = value, Raw = value == Math.Floor(value) && Math.Abs(value) < 1e15 ? ((long)value).ToString(CultureInfo.InvariantCulture) : value.ToString("0.######", CultureInfo.InvariantCulture) };
+    }
+}
+
+public sealed class PdfLiteName : PdfLiteObject
+{
+    public string Value;
+    public PdfLiteName(string value) { Value = value; }
+}
+
+public sealed class PdfLiteString : PdfLiteObject
+{
+    public byte[] Bytes;
+    public bool Hex;
+}
+
+public sealed class PdfLiteKeyword : PdfLiteObject
+{
+    public string Value;
+}
+
+public sealed class PdfLiteArray : PdfLiteObject
+{
+    public List<PdfLiteObject> Items = new List<PdfLiteObject>();
+}
+
+public sealed class PdfLiteRef : PdfLiteObject
+{
+    public int Number, Generation;
+    public PdfLiteRef(int number, int generation) { Number = number; Generation = generation; }
+}
+
+public sealed class PdfLiteDict : PdfLiteObject
+{
+    public List<KeyValuePair<string, PdfLiteObject>> Items = new List<KeyValuePair<string, PdfLiteObject>>();
+    /// <summary>The stream's bytes as stored (still encoded), or null for a plain dictionary.</summary>
+    public byte[] Stream;
+
+    public PdfLiteObject Get(string key)
+    {
+        foreach (var pair in Items) if (pair.Key == key) return pair.Value;
+        return null;
+    }
+
+    public void Set(string key, PdfLiteObject value)
+    {
+        for (var i = 0; i < Items.Count; i++)
+            if (Items[i].Key == key) { Items[i] = new KeyValuePair<string, PdfLiteObject>(key, value); return; }
+        Items.Add(new KeyValuePair<string, PdfLiteObject>(key, value));
+    }
+
+    public PdfLiteDict ShallowCopy()
+    {
+        var copy = new PdfLiteDict { Stream = Stream };
+        copy.Items.AddRange(Items);
+        return copy;
+    }
+}
+
+public sealed class PdfLiteOp
+{
+    public string Name;
+    public List<PdfLiteObject> Operands = new List<PdfLiteObject>();
+    /// <summary>An inline image (BI … EI) kept byte for byte.</summary>
+    public byte[] Raw;
+
+    public PdfLiteOp(string name, params PdfLiteObject[] operands) { Name = name; Operands.AddRange(operands); }
+}
+
+internal sealed class PdfLiteParser
+{
+    private readonly byte[] _data;
+    private readonly PdfLiteDocument _document;
+    public int Position;
+
+    public PdfLiteParser(byte[] data, PdfLiteDocument document) { _data = data; _document = document; }
+
+    private static bool IsSpace(byte b) { return b == 0 || b == 9 || b == 10 || b == 12 || b == 13 || b == 32; }
+    private static bool IsDelimiter(byte b) { return b == '(' || b == ')' || b == '<' || b == '>' || b == '[' || b == ']' || b == '{' || b == '}' || b == '/' || b == '%'; }
+
+    public void SkipSpace()
+    {
+        while (Position < _data.Length)
+        {
+            if (IsSpace(_data[Position])) Position++;
+            else if (_data[Position] == '%') { while (Position < _data.Length && _data[Position] != '\n' && _data[Position] != '\r') Position++; }
+            else break;
+        }
+    }
+
+    public bool PeekKeyword(string word)
+    {
+        SkipSpace();
+        if (Position + word.Length > _data.Length) return false;
+        for (var i = 0; i < word.Length; i++) if (_data[Position + i] != word[i]) return false;
+        return Position + word.Length == _data.Length || IsSpace(_data[Position + word.Length]) || IsDelimiter(_data[Position + word.Length]);
+    }
+
+    public void Expect(string word)
+    {
+        if (!PeekKeyword(word)) throw new InvalidDataException("PDFの構造を読めません（" + word + "がありません）。");
+        Position += word.Length;
+    }
+
+    public string ReadKeyword()
+    {
+        SkipSpace();
+        var start = Position;
+        while (Position < _data.Length && !IsSpace(_data[Position]) && !IsDelimiter(_data[Position])) Position++;
+        return Encoding.ASCII.GetString(_data, start, Position - start);
+    }
+
+    public int ReadInteger() { return (int)ReadLong(); }
+
+    public long ReadLong()
+    {
+        long value;
+        if (!long.TryParse(ReadKeyword(), NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) throw new InvalidDataException("PDFの構造を読めません（数値がありません）。");
+        return value;
+    }
+
+    public PdfLiteObject ReadObject()
+    {
+        SkipSpace();
+        if (Position >= _data.Length) throw new InvalidDataException("PDFが途中で終わっています。");
+        var b = _data[Position];
+        if (b == '/') return ReadName();
+        if (b == '(') return ReadLiteral();
+        if (b == '[')
+        {
+            Position++;
+            var array = new PdfLiteArray();
+            while (true)
+            {
+                SkipSpace();
+                if (Position >= _data.Length) throw new InvalidDataException("PDFの配列が閉じていません。");
+                if (_data[Position] == ']') { Position++; return array; }
+                array.Items.Add(ReadObject());
+            }
+        }
+        if (b == '<' && Position + 1 < _data.Length && _data[Position + 1] == '<')
+        {
+            Position += 2;
+            var dict = new PdfLiteDict();
+            while (true)
+            {
+                SkipSpace();
+                if (Position + 1 < _data.Length && _data[Position] == '>' && _data[Position + 1] == '>') { Position += 2; break; }
+                var key = ReadObject() as PdfLiteName;
+                if (key == null) throw new InvalidDataException("PDFの辞書を読めません。");
+                dict.Set(key.Value, ReadObject());
+            }
+            var save = Position;
+            if (_document != null && PeekKeyword("stream"))
+            {
+                Position += 6;
+                if (Position < _data.Length && _data[Position] == '\r') Position++;
+                if (Position < _data.Length && _data[Position] == '\n') Position++;
+                var length = (int)PdfLiteDocument.Number(_document.Resolve(dict.Get("Length")));
+                if (length <= 0 || Position + length > _data.Length || !EndstreamAt(Position + length))
+                {
+                    var end = Find("endstream", Position);
+                    if (end < 0) throw new InvalidDataException("PDFのデータが閉じていません。");
+                    length = end - Position;
+                    while (length > 0 && (_data[Position + length - 1] == '\n' || _data[Position + length - 1] == '\r')) length--;
+                }
+                dict.Stream = new byte[length];
+                Buffer.BlockCopy(_data, Position, dict.Stream, 0, length);
+                Position += length;
+                SkipSpace();
+                if (PeekKeyword("endstream")) Position += 9;
+            }
+            else Position = save;
+            return dict;
+        }
+        if (b == '<')
+        {
+            Position++;
+            var hex = new StringBuilder();
+            while (Position < _data.Length && _data[Position] != '>') { if (!IsSpace(_data[Position])) hex.Append((char)_data[Position]); Position++; }
+            Position++;
+            if (hex.Length % 2 == 1) hex.Append('0');
+            var bytes = new byte[hex.Length / 2];
+            for (var i = 0; i < bytes.Length; i++) bytes[i] = byte.Parse(hex.ToString(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture);
+            return new PdfLiteString { Bytes = bytes, Hex = true };
+        }
+        var word = ReadKeyword();
+        if (word.Length == 0) { Position++; return new PdfLiteKeyword { Value = ((char)b).ToString() }; }
+        double number;
+        if ((char.IsDigit(word[0]) || word[0] == '-' || word[0] == '+' || word[0] == '.') && double.TryParse(word, NumberStyles.Float, CultureInfo.InvariantCulture, out number))
+        {
+            // "12 0 R" is a reference.
+            if (_document != null && word.IndexOf('.') < 0 && word[0] != '-' && word[0] != '+')
+            {
+                var save = Position;
+                var second = ReadKeyword();
+                int generation;
+                if (int.TryParse(second, NumberStyles.None, CultureInfo.InvariantCulture, out generation) && ReadKeyword() == "R") return new PdfLiteRef((int)number, generation);
+                Position = save;
+            }
+            return new PdfLiteNumber { Value = number, Raw = word };
+        }
+        if (word == "true" || word == "false" || word == "null") return new PdfLiteKeyword { Value = word };
+        return new PdfLiteKeyword { Value = word };
+    }
+
+    private bool EndstreamAt(int at)
+    {
+        var parser = new PdfLiteParser(_data, null) { Position = at };
+        return parser.PeekKeyword("endstream");
+    }
+
+    private int Find(string word, int from)
+    {
+        var bytes = Encoding.ASCII.GetBytes(word);
+        for (var i = from; i + bytes.Length <= _data.Length; i++)
+        {
+            var hit = true;
+            for (var k = 0; k < bytes.Length && hit; k++) hit = _data[i + k] == bytes[k];
+            if (hit) return i;
+        }
+        return -1;
+    }
+
+    private PdfLiteName ReadName()
+    {
+        Position++;
+        var bytes = new List<byte>();
+        while (Position < _data.Length && !IsSpace(_data[Position]) && !IsDelimiter(_data[Position]))
+        {
+            if (_data[Position] == '#' && Position + 2 < _data.Length)
+            {
+                int value;
+                if (int.TryParse(Encoding.ASCII.GetString(_data, Position + 1, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out value)) { bytes.Add((byte)value); Position += 3; continue; }
+            }
+            bytes.Add(_data[Position++]);
+        }
+        return new PdfLiteName(Encoding.GetEncoding(28591).GetString(bytes.ToArray()));
+    }
+
+    private PdfLiteString ReadLiteral()
+    {
+        Position++;
+        var bytes = new List<byte>();
+        var depth = 1;
+        while (Position < _data.Length)
+        {
+            var b = _data[Position++];
+            if (b == '\\' && Position < _data.Length)
+            {
+                var e = _data[Position++];
+                if (e == 'n') bytes.Add(10); else if (e == 'r') bytes.Add(13); else if (e == 't') bytes.Add(9); else if (e == 'b') bytes.Add(8); else if (e == 'f') bytes.Add(12);
+                else if (e >= '0' && e <= '7')
+                {
+                    var value = e - '0';
+                    for (var k = 0; k < 2 && Position < _data.Length && _data[Position] >= '0' && _data[Position] <= '7'; k++) value = value * 8 + (_data[Position++] - '0');
+                    bytes.Add((byte)value);
+                }
+                else if (e == '\r') { if (Position < _data.Length && _data[Position] == '\n') Position++; }
+                else if (e == '\n') { }
+                else bytes.Add(e);
+                continue;
+            }
+            if (b == '(') depth++;
+            if (b == ')' && --depth == 0) break;
+            bytes.Add(b);
+        }
+        return new PdfLiteString { Bytes = bytes.ToArray(), Hex = false };
+    }
+
+    /// <summary>A content stream as operators with their operands.</summary>
+    public List<PdfLiteOp> ReadContent()
+    {
+        var ops = new List<PdfLiteOp>();
+        var operands = new List<PdfLiteObject>();
+        while (true)
+        {
+            SkipSpace();
+            if (Position >= _data.Length) break;
+            var start = Position;
+            var value = ReadObject();
+            var keyword = value as PdfLiteKeyword;
+            if (keyword == null || keyword.Value == "true" || keyword.Value == "false" || keyword.Value == "null") { operands.Add(value); continue; }
+            if (keyword.Value == "BI")
+            {
+                // Inline image: kept as it is up to EI.
+                var end = Position;
+                while (end + 2 <= _data.Length && !(_data[end] == 'E' && _data[end + 1] == 'I' && IsSpace(_data[end - 1]) && (end + 2 == _data.Length || IsSpace(_data[end + 2])))) end++;
+                end = Math.Min(_data.Length, end + 2);
+                var raw = new byte[end - start];
+                Buffer.BlockCopy(_data, start, raw, 0, raw.Length);
+                var inline = new PdfLiteOp("BI");
+                inline.Raw = raw;
+                ops.Add(inline);
+                Position = end;
+                operands.Clear();
+                continue;
+            }
+            var op = new PdfLiteOp(keyword.Value);
+            op.Operands.AddRange(operands);
+            ops.Add(op);
+            operands.Clear();
+        }
+        return ops;
+    }
+}
+
+internal static class PdfLiteWriter
+{
+    public static void WriteOp(Stream output, PdfLiteOp op)
+    {
+        if (op.Raw != null) { output.Write(op.Raw, 0, op.Raw.Length); return; }
+        foreach (var operand in op.Operands) { Write(output, operand); output.WriteByte((byte)' '); }
+        Text(output, op.Name);
+    }
+
+    public static void Write(Stream output, PdfLiteObject value)
+    {
+        if (value == null) { Text(output, "null"); return; }
+        var number = value as PdfLiteNumber;
+        if (number != null) { Text(output, number.Raw ?? PdfLiteNumber.Of(number.Value).Raw); return; }
+        var name = value as PdfLiteName;
+        if (name != null)
+        {
+            output.WriteByte((byte)'/');
+            foreach (var b in Encoding.GetEncoding(28591).GetBytes(name.Value))
+            {
+                if (b < 33 || b > 126 || b == '#' || b == '/' || b == '(' || b == ')' || b == '<' || b == '>' || b == '[' || b == ']' || b == '{' || b == '}' || b == '%')
+                    Text(output, "#" + b.ToString("X2"));
+                else output.WriteByte(b);
+            }
+            return;
+        }
+        var text = value as PdfLiteString;
+        if (text != null)
+        {
+            var hex = new StringBuilder("<");
+            foreach (var b in text.Bytes) hex.Append(b.ToString("X2"));
+            Text(output, hex.Append('>').ToString());
+            return;
+        }
+        var keyword = value as PdfLiteKeyword;
+        if (keyword != null) { Text(output, keyword.Value); return; }
+        var reference = value as PdfLiteRef;
+        if (reference != null) { Text(output, reference.Number + " " + reference.Generation + " R"); return; }
+        var array = value as PdfLiteArray;
+        if (array != null)
+        {
+            output.WriteByte((byte)'[');
+            for (var i = 0; i < array.Items.Count; i++) { if (i > 0) output.WriteByte((byte)' '); Write(output, array.Items[i]); }
+            output.WriteByte((byte)']');
+            return;
+        }
+        var dict = (PdfLiteDict)value;
+        if (dict.Stream != null) dict.Set("Length", PdfLiteNumber.Of(dict.Stream.Length));
+        Text(output, "<<");
+        foreach (var pair in dict.Items)
+        {
+            Write(output, new PdfLiteName(pair.Key));
+            output.WriteByte((byte)' ');
+            Write(output, pair.Value);
+            output.WriteByte((byte)'\n');
+        }
+        Text(output, ">>");
+        if (dict.Stream != null)
+        {
+            Text(output, "\nstream\n");
+            output.Write(dict.Stream, 0, dict.Stream.Length);
+            Text(output, "\nendstream");
+        }
+    }
+
+    private static void Text(Stream output, string text)
+    {
+        var bytes = Encoding.ASCII.GetBytes(text);
+        output.Write(bytes, 0, bytes.Length);
+    }
+}

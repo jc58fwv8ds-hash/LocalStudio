@@ -8,6 +8,12 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
   <ItemGroup>
+    <!-- The PDF helper given to generated Windows apps, run here on real PDFs (pdflite-trial). -->
+    <Compile Include="..\SafeLocalHarness.Core\Toolbox\PdfLite.cs.txt" Link="Toolbox\PdfLite.cs" />
+    <!-- The Excel helper, run here on real workbooks (xlsx-combine). -->
+    <Compile Include="..\SafeLocalHarness.Core\Toolbox\XlsxLite.cs.txt" Link="Toolbox\XlsxLite.cs" />
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\SafeLocalHarness.Core\SafeLocalHarness.Core.csproj" />
     <ProjectReference Include="..\SafeLocalHarness.Windows\SafeLocalHarness.Windows.csproj" />
   </ItemGroup>

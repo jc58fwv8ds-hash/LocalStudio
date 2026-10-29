@@ -65,6 +65,16 @@ public partial class ChatView : UserControl
             MessageBox.Show(reason, "LocalStudio", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 
+    // The mode menu opens on a normal click, above the button.
+    private void OnModeClick(object sender, RoutedEventArgs e)
+    {
+        if (ModeButton.ContextMenu is not { } menu) return;
+        menu.DataContext = DataContext;
+        menu.PlacementTarget = ModeButton;
+        menu.Placement = System.Windows.Controls.Primitives.PlacementMode.Top;
+        menu.IsOpen = true;
+    }
+
     private void OnDragOver(object sender, DragEventArgs e)
     {
         e.Effects = e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;

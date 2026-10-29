@@ -65,6 +65,11 @@ public sealed class WindowsExecutableCompiler : IWindowsExecutableCompiler
         start.ArgumentList.Add("/reference:System.Core.dll");
         start.ArgumentList.Add("/reference:System.Drawing.dll");
         start.ArgumentList.Add("/reference:System.Windows.Forms.dll");
+        // Microsoft.VisualBasic.Interaction.InputBox is the Framework's own one-line input dialog; a flashcard EXE was given up
+        // after 20 repairs because the reference was missing (catalogue 2026-10-20).
+        start.ArgumentList.Add("/reference:Microsoft.VisualBasic.dll");
+        // What the reviewed helpers need (Excel workbooks are zip files of XML); all part of the Windows .NET Framework.
+        foreach (var reference in WindowsToolbox.References) start.ArgumentList.Add("/reference:" + reference);
         foreach (var source in sources) start.ArgumentList.Add(source);
 
         using var process = new Process { StartInfo = start };
@@ -81,8 +86,13 @@ public sealed class WindowsExecutableCompiler : IWindowsExecutableCompiler
             throw;
         }
         var diagnostics = (await standardOutput + "\n" + await standardError).Trim();
+        // Errors first: the message is cut at 500 characters, and harmless warnings (CS0108 "hides inherited member")
+        // filled it so the error itself was cut off (memory game, catalogue 2026-10-20).
+        var diagnosticLines = diagnostics.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        diagnostics = string.Join("\n", diagnosticLines.Where(line => line.Contains(": error ", StringComparison.Ordinal))
+            .Concat(diagnosticLines.Where(line => !line.Contains(": error ", StringComparison.Ordinal))));
         if (process.ExitCode != 0 || !File.Exists(output))
-            throw new InvalidDataException("Windows EXEの作成に失敗しました。" + (diagnostics.Length == 0 ? "" : " " + diagnostics[..Math.Min(diagnostics.Length, 500)]));
+            throw new InvalidDataException("Windows EXEの作成に失敗しました。" + (diagnostics.Length == 0 ? "" : " " + diagnostics[..Math.Min(diagnostics.Length, 900)]));
         await using var stream = File.OpenRead(output);
         var header = new byte[2];
         if (await stream.ReadAsync(header, cancellationToken) != 2 || header[0] != (byte)'M' || header[1] != (byte)'Z')
@@ -116,9 +126,8 @@ public sealed class WindowsAppSourceVerifier
             : [];
         var manifestPath = Path.Combine(projectRoot, "app.manifest");
         var requirementsPath = Path.Combine(projectRoot, "requirements.json");
-        var source = sourcePaths.Length == 0
-            ? ""
-            : string.Join("\n", await Task.WhenAll(sourcePaths.Select(path => File.ReadAllTextAsync(path, Encoding.UTF8, cancellationToken))));
+        // The app's own code is checked; reviewed helpers exactly as shipped (WindowsToolbox) are left out.
+        var source = sourcePaths.Length == 0 ? "" : WindowsToolbox.AppSources(projectRoot);
         var manifest = File.Exists(manifestPath) ? await File.ReadAllTextAsync(manifestPath, Encoding.UTF8, cancellationToken) : "";
         var requirements = File.Exists(requirementsPath) ? await File.ReadAllTextAsync(requirementsPath, Encoding.UTF8, cancellationToken) : "";
         Check(File.Exists(sourcePath) && source.Length > 0 && manifest.Length > 0 && requirements.Length > 0, "files.native-windows", passed, errors);
@@ -147,19 +156,20 @@ public sealed class WindowsAppSourceVerifier
         {
             Check(source.Length is > 200 and <= 256 * 1024, "generated.source-size", passed, errors);
             Check(source.Contains("Application.Run", StringComparison.Ordinal) && source.Contains(": Form", StringComparison.Ordinal), "generated.windows-entrypoint", passed, errors);
-            Check(source.Contains("+=", StringComparison.Ordinal) &&
-                  (source.Contains("Timer", StringComparison.Ordinal) || source.Contains("OnPaint", StringComparison.Ordinal) || source.Contains(".Click", StringComparison.Ordinal) || source.Contains("KeyDown", StringComparison.Ordinal)), "generated.interactive", passed, errors);
+            Check(LocalWindowsAppGenerationEngine.IsInteractive(source), "generated.interactive", passed, errors);
             Check(requestedFeatureCount is > 0 and <= 8, "generated.requirements-valid", passed, errors);
-            var usesFileSystem = source.Contains("File.", StringComparison.Ordinal) || source.Contains("Directory.", StringComparison.Ordinal);
-            Check(!usesFileSystem || source.Contains("Environment.SpecialFolder.LocalApplicationData", StringComparison.Ordinal), "generated.user-storage-only", passed, errors);
+            // The same file rule as generation (own folder, or files the user picks; never delete), so a source the
+            // generator accepted is not refused here (catalogue 2026-10-19: a daily report looped on this check).
+            var storage = LocalWindowsAppGenerationEngine.ValidateSource(source);
+            Check(!storage.Contains("security.user-storage-only") && !storage.Contains("security.no-delete"), "generated.user-storage-only", passed, errors);
         }
         else
         {
             errors.Add("requirements.unsupported-native-app-type");
         }
 
-        var forbidden = new[] { "System.Net", "HttpClient", "WebClient", "Process.Start", "System.Diagnostics", "Registry", "Microsoft.Win32", "DllImport", "System.Reflection", "Assembly.Load", "unsafe", "dynamic", "runas", "cmd.exe", "powershell" };
-        Check(forbidden.All(token => !source.Contains(token, StringComparison.OrdinalIgnoreCase)), "security.no-network-or-process", passed, errors);
+        // The same API rules as generation (API names, not substrings such as a method named ProcessFiles).
+        Check(!LocalWindowsAppGenerationEngine.ValidateSource(source).Any(error => error.StartsWith("security.forbidden-api", StringComparison.Ordinal)), "security.no-network-or-process", passed, errors);
         Check(manifest.Contains("requestedExecutionLevel level=\"asInvoker\"", StringComparison.Ordinal), "security.as-invoker", passed, errors);
         Check(requirements.Contains("\"adminRequired\": false", StringComparison.Ordinal) && requirements.Contains("\"networkRequired\": false", StringComparison.Ordinal), "requirements.native-windows", passed, errors);
         return new(errors.Count == 0, passed, errors, DateTimeOffset.Now);

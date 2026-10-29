@@ -25,6 +25,9 @@ public sealed class ResourceModeState
 
     public ResourceMode Current => _sessionExpert ? ResourceMode.Expert : _settings.Load().ResourceMode;
 
+    /// <summary>Raised after every change, wherever it was made (the Setup screen or the chat's mode button).</summary>
+    public event Action<ResourceMode>? Changed;
+
     public async Task SetAsync(ResourceMode mode, CancellationToken cancellationToken = default)
     {
         if (mode == ResourceMode.Expert)
@@ -32,11 +35,23 @@ public sealed class ResourceModeState
             // Persist Coexistence so that closing the app always returns to the default.
             await _settings.SaveAsync(_settings.Load() with { ResourceMode = ResourceMode.Coexistence }, cancellationToken);
             _sessionExpert = true;
+            Changed?.Invoke(mode);
             return;
         }
         _sessionExpert = false;
         await _settings.SaveAsync(_settings.Load() with { ResourceMode = mode }, cancellationToken);
+        Changed?.Invoke(mode);
     }
+}
+
+/// <summary>Recognises the replies in which a memory guard stopped AI work, so the chat can offer a mode change there.</summary>
+public static class MemoryGuardMessages
+{
+    private static readonly System.Text.RegularExpressions.Regex Refusal = new(
+        "AIの処理を開始しません|重い処理は開始しません|今の空きメモリ|AIを動かせません|空きメモリまたはディスク容量では",
+        System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    public static bool IsRefusal(string? text) => !string.IsNullOrEmpty(text) && Refusal.IsMatch(text);
 }
 
 public enum MemoryPressureLevel

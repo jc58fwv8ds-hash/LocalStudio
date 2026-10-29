@@ -125,7 +125,7 @@ public sealed class LibraryWindow : Window
             _files.Items.Clear();
             foreach (var file in fetched.Candidates) _files.Items.Add(file);
             if (_files.Items.Count > 0) _files.SelectedItems.Add(_files.Items[0]);
-            _name.Text = info.Name;
+            _name.Text = NpmLibrarySource.ShelfName(info.Name);
             _version.Text = info.Version;
             _license.Text = info.License;
             _source.Text = info.TarballUrl;

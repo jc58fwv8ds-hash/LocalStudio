@@ -26,6 +26,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Reviewed C# 5 helpers copied into generated Windows apps that need them (see WindowsToolbox); not compiled here. -->
+    <!-- WithCulture=false: otherwise ".cs" in the name is read as the Czech culture and the file goes to a satellite assembly. -->
+    <EmbeddedResource Include="Toolbox\XlsxLite.cs.txt" LogicalName="SafeLocalHarness.Core.Toolbox.XlsxLite.cs.txt" WithCulture="false" />
+    <EmbeddedResource Include="Toolbox\PdfLite.cs.txt" LogicalName="SafeLocalHarness.Core.Toolbox.PdfLite.cs.txt" WithCulture="false" />
   </ItemGroup>
 
 </Project>

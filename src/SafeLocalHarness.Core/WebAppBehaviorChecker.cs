@@ -43,8 +43,9 @@ public static class WebAppBehaviorChecker
         var __ls_nextTimer = 1;
         var __ls_offset = 0;
         var __ls_env = [];
-        var __ls_intervals = 0;
+        var __ls_intervals = 0; var __ls_sounds = 0; var __ls_downloads = 0;
         var __ls_draws = 0;
+        var __ls_blobs = [];
         var __ls_strokes = 0;
         var __ls_pen = null;
         var __ls_dragged = 0;
@@ -79,8 +80,42 @@ public static class WebAppBehaviorChecker
           // The engine's window ignores assignments, so the app receives these as function parameters that shadow the
           // globals of the same name (see AppParameters).
           var repeat = function (f) { __ls_intervals++; return add(f, true); };
+          // Sound (Audio, Web Audio, speech) accepts any use and only counts it: an app that really makes a sound was refused
+          // with "Audio is not defined" (metronome, catalogue 2026-10-19). Nothing is played.
+          var sound = function () {
+            var target = function () {};
+            return new Proxy(target, {
+              // A source node starts once, as in a browser: a metronome that called osc.start() on every beat played once
+              // and then threw (catalogue 2026-10-20), which a stand-in that accepted anything could not show.
+              get: function (t, p) { if (p === Symbol.toPrimitive) return function () { return 0; }; if (p === 'then') return undefined; if (p === 'currentTime' || p === 'length') return 0;
+                if (p === 'start') return function () { if (t.__ls_started) throw new Error('InvalidStateError: start() can only be called once on this sound source; create a new oscillator (ctx.createOscillator()) for every beat'); t.__ls_started = true; __ls_sounds++; return sound(); };
+                return sound(); },
+              set: function () { return true; },
+              apply: function () { __ls_sounds++; return sound(); },
+              construct: function () { return sound(); }
+            });
+          };
+          // Files made for download: the engine has no Blob ("Illegal constructor", CSV cleaner 2026-10-19). The parts are kept;
+          // nothing is written or downloaded.
+          var FakeBlob = function (parts, options) { this.parts = parts || []; this.type = (options && options.type) || ''; this.size = this.parts.join('').length; __ls_downloads++; __ls_blobs.push(this.parts.join('')); };
+          FakeBlob.prototype.text = function () { return Promise.resolve(this.parts.join('')); };
+          var fakeUrl = { createObjectURL: function () { return 'blob:localstudio-check'; }, revokeObjectURL: function () {} };
+          // A chosen file is read as text after a moment, as in a browser (onload / load listeners, result).
+          var FakeFileReader = function () { this.result = null; this.onload = null; this.onloadend = null; this.onerror = null; this.__ls_l = {}; };
+          FakeFileReader.prototype.__ls_on = FakeFileReader.prototype.addEventListener = function (type, f) { (this.__ls_l[type] = this.__ls_l[type] || []).push(f); };
+          FakeFileReader.prototype.readAsText = function (file) {
+            var self = this;
+            later(function () {
+              self.result = file && file.__ls_text !== undefined ? file.__ls_text : '';
+              var event = { target: self, currentTarget: self };
+              if (typeof self.onload === 'function') self.onload(event);
+              (self.__ls_l.load || []).forEach(function (f) { f.call(self, event); });
+              if (typeof self.onloadend === 'function') self.onloadend(event);
+              (self.__ls_l.loadend || []).forEach(function (f) { f.call(self, event); });
+            });
+          };
           __ls_env = [later, repeat, clear, clear, frame, clear, FakeDate, fakePerformance, storage, storage,
-            function () {}, function () { return true; }, function () { return ''; }];
+            function () {}, function () { return true; }, function () { return ''; }, sound(), sound(), sound(), sound(), sound(), FakeBlob, fakeUrl, FakeFileReader];
           // append/prepend/replaceChildren with text and elements mixed fail inside this engine (a cast error), and its
           // methods cannot be replaced, so the app's calls are pointed to these browser-equivalent versions. Anything
           // that is not a page node (FormData.append) is passed on to its own method.
@@ -155,7 +190,7 @@ public static class WebAppBehaviorChecker
         })();
         """;
 
-    private const string AppParameters = "setTimeout, setInterval, clearTimeout, clearInterval, requestAnimationFrame, cancelAnimationFrame, Date, performance, localStorage, sessionStorage, alert, confirm, prompt";
+    private const string AppParameters = "setTimeout, setInterval, clearTimeout, clearInterval, requestAnimationFrame, cancelAnimationFrame, Date, performance, localStorage, sessionStorage, alert, confirm, prompt, Audio, AudioContext, webkitAudioContext, speechSynthesis, SpeechSynthesisUtterance, Blob, URL, FileReader";
 
     // A library global that accepts any use: calls, new, property chains (chart.data.labels.push(…)).
     private static string LibraryStandIn(string global) => $$"""
@@ -335,6 +370,9 @@ public static class WebAppBehaviorChecker
                 }
             }
             RunTimers(Run);
+            // A repeating timer this step started runs a second time too: what goes wrong on the second beat (a sound
+            // source started twice, 2026-10-20) only shows then.
+            if (Intervals() > intervalsBefore) RunTimers(Run);
             var errors = DrainErrors(document).ToList();
             if (error is not null) errors.Insert(0, error);
             // Drawing on a canvas changes what is seen without changing the page's elements.
@@ -435,6 +473,255 @@ public static class WebAppBehaviorChecker
         if (inconclusive.Count > 0) notes.Add("この確かめ方では判定できない部分がありました: " + string.Join(" / ", inconclusive.Distinct().Take(3)));
         return new(null, steps, problems, notes);
     }
+
+    /// <summary>
+    /// Plays acceptance scenarios on the app, each on a freshly opened page (storage carried over only by a "reload"
+    /// step), and returns what did not hold: a control the scenario names that is not on the screen, an error, or text
+    /// that should (or should not) be shown afterwards. Empty when every scenario holds.
+    /// </summary>
+    public static async Task<IReadOnlyList<string>> CheckScenariosAsync(string html, string script, IReadOnlyList<string> libraryGlobals,
+        IReadOnlyList<AcceptanceScenario> scenarios, CancellationToken cancellationToken = default, bool reportInconclusive = false)
+    {
+        // Generation does not repair what the engine could not play; a yardstick (the catalogue) must not count it as held.
+        var failures = new List<string>();
+        foreach (var scenario in AcceptanceScenario.Usable(scenarios))
+        {
+            var run = Task.Run(() => PlayScenarioAsync(html, script, libraryGlobals, scenario, cancellationToken), cancellationToken);
+            var finished = await Task.WhenAny(run, Task.Delay(OverallTimeLimit, cancellationToken));
+            if (finished != run)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (reportInconclusive) failures.Add($"acceptance.inconclusive:{scenario.Title}: took too long to play");
+                continue;
+            }
+            try { failures.AddRange(await run); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                if (reportInconclusive) failures.Add($"acceptance.inconclusive:{scenario.Title}: could not be played ({ex.GetType().Name})");
+            }
+        }
+        return failures;
+    }
+
+    // Finds the control a user would mean by a name: its label, aria-label, placeholder, title, button text, the text just
+    // before it, or its id; an exact name wins over a partial one.
+    private const string FindControl = """
+        (function (kind, wanted) {
+          var norm = function (s) { return String(s || '').replace(/[\s:：「」()（）*＊]/g, '').toLowerCase(); };
+          var wants = String(wanted || '').split('|').map(norm).filter(function (w) { return w.length > 0; });
+          if (!wants.length) return '';
+          var root = document.getElementById('app') || document.body;
+          var selector = kind === 'press' ? 'button, input[type=button], input[type=submit]' :
+                         kind === 'file' ? 'input[type=file]' :
+                         kind === 'choose' ? 'select, input[type=radio]' : 'input:not([type=button]):not([type=submit]):not([type=radio]), textarea, select';
+          var names = function (el) {
+            var list = [el.getAttribute('aria-label'), el.getAttribute('placeholder'), el.getAttribute('title'), el.getAttribute('name'), el.id];
+            if (el.tagName === 'BUTTON') list.push(el.textContent);
+            if (el.tagName === 'INPUT' && /^(button|submit)$/i.test(el.type || '')) list.push(el.value);
+            if (el.id) { var labels = root.querySelectorAll('label[for="' + el.id + '"]'); for (var i = 0; i < labels.length; i++) list.push(labels[i].textContent); }
+            var parent = el.closest ? el.closest('label') : null; if (parent) list.push(parent.textContent);
+            var before = el.previousElementSibling; if (before && /^(LABEL|SPAN|P|DIV|STRONG|B)$/.test(before.tagName)) list.push(before.textContent);
+            if (el.parentElement && el.parentElement.firstChild && el.parentElement.firstChild.nodeType === 3) list.push(el.parentElement.firstChild.textContent);
+            if (el.type === 'radio') { var r = el.nextSibling; if (r) list.push(r.textContent); }
+            return list.map(norm).filter(function (n) { return n.length > 0; });
+          };
+          var best = null, score = 0;
+          var all = root.querySelectorAll(selector);
+          for (var i = 0; i < all.length; i++) {
+            var ns = names(all[i]);
+            for (var j = 0; j < ns.length; j++)
+              for (var k = 0; k < wants.length; k++) {
+                var want = wants[k];
+                var s = ns[j] === want ? 3 : ns[j].indexOf(want) >= 0 ? 2 : want.indexOf(ns[j]) >= 0 && ns[j].length >= 2 ? 1 : 0;
+                if (s > score) { score = s; best = all[i]; }
+              }
+          }
+          // Something the user clicks that is not a button: a checkbox named so, or a list item, cell or card showing
+          // exactly that text (a habit marked done by clicking it, 2026-10-20).
+          // The only file picker on the screen is the one meant, whatever it is called.
+          if (!best && kind === 'file' && all.length === 1) best = all[0];
+          if (!best && kind === 'press') {
+            var others = root.querySelectorAll('input[type=checkbox], li, td, span, div, label, a, p');
+            // The innermost match wins (it comes last in document order), so the click reaches the item's own handler.
+            for (var i = 0; i < others.length; i++) {
+              var own = others[i].tagName === 'INPUT' ? names(others[i]) : [norm(others[i].textContent)];
+              for (var k = 0; k < wants.length; k++) if (own.indexOf(wants[k]) >= 0) best = others[i];
+            }
+          }
+          if (!best) return '';
+          var mark = '__ls_scenario_' + Math.floor(Math.random() * 1e9);
+          best.setAttribute('data-ls-scenario', mark);
+          return mark;
+        })
+        """;
+
+    private static async Task<IReadOnlyList<string>> PlayScenarioAsync(string html, string script, IReadOnlyList<string> libraryGlobals, AcceptanceScenario scenario, CancellationToken cancellationToken)
+    {
+        var failures = new List<string>();
+        var page = Regex.Replace(html, @"<script\b[^>]*>.*?</script>", "", RegexOptions.Singleline | RegexOptions.IgnoreCase);
+        page = Regex.Replace(page, @"<meta[^>]+Content-Security-Policy[^>]*>", "", RegexOptions.IgnoreCase);
+        EngineCreator limited = (_, options) =>
+        {
+            Jint.ConstraintsOptionsExtensions.TimeoutInterval(options, ScriptTimeLimit);
+            Jint.ConstraintsOptionsExtensions.MaxStatements(options, MaxStatements);
+            Jint.ConstraintsOptionsExtensions.LimitMemory(options, MaxMemoryBytes);
+            return new Jint.Engine(options);
+        };
+        var config = Configuration.Default.WithJs().With(limited);
+        using var context = BrowsingContext.New(config);
+        AngleSharp.Dom.IDocument? document = null;
+        string? Run(string code)
+        {
+            try { document!.ExecuteScript(code); return null; }
+            catch (Exception ex) when (IsLimit(ex)) { return "止まらない処理"; }
+            catch (Exception ex) when (ex is Jint.Runtime.JavaScriptException) { return ex.Message; }
+            catch (Exception) { return null; }
+        }
+        string Eval(string code)
+        {
+            try { return document!.ExecuteScript(code)?.ToString() ?? ""; }
+            catch (Exception) { return ""; }
+        }
+
+        // Days passed (a "next day" step): the app's clock (Date, Date.now) runs that many days ahead after each reopening.
+        var days = 0;
+        async Task<string?> OpenAsync(string storedJson)
+        {
+            document = await context.OpenAsync(request => request.Content(page).Address("https://localstudio.invalid/"), cancellationToken);
+            Run(Prelude);
+            if (days > 0) Run($"__ls_offset = {days} * 86400000;");
+            if (storedJson.Length > 2) Run("(function (s) { for (var k in s) __ls_env[8].setItem(k, s[k]); })(" + storedJson + ");");
+            foreach (var global in libraryGlobals.Distinct().Where(global => Regex.IsMatch(global, @"^[A-Za-z_$][\w$]*$"))) Run(LibraryStandIn(global));
+            var loadError = Run("(function (" + AppParameters + ") {\n" + PointToStandIns(script) + "\n}).apply(window, __ls_env);");
+            if (loadError is null)
+                Run("document.dispatchEvent(new Event('DOMContentLoaded', { bubbles: true })); window.dispatchEvent(new Event('load')); if (typeof window.onload === 'function') { try { window.onload(); } catch (e) { __ls_errors.push('load: ' + e); } }");
+            RunTimers(Run);
+            return Readable(loadError) ?? DrainErrors(document!).FirstOrDefault();
+        }
+
+        var opened = await OpenAsync("{}");
+        if (opened is not null) { failures.Add($"acceptance.error:{scenario.Title}: the page fails when opened: {opened}"); return failures; }
+        var done = new List<string>();
+        foreach (var step in scenario.Steps)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string? error = null;
+            if (step.Reload || step.NextDay)
+            {
+                if (step.NextDay) days++;
+                var stored = Eval("(function () { var s = {}, st = __ls_env[8]; for (var i = 0; i < st.length; i++) { var k = st.key(i); s[k] = st.getItem(k); } return JSON.stringify(s); })()");
+                error = await OpenAsync(string.IsNullOrEmpty(stored) ? "{}" : stored);
+            }
+            else if (step.Tick) { RunTimers(Run); RunTimers(Run); }
+            else
+            {
+                var (kind, name) = step.Set is not null ? ("set", step.Set) : step.Choose is not null ? ("choose", step.Choose) : step.File is not null ? ("file", step.File) : ("press", step.Press!);
+                var mark = Eval(FindControl + "(" + JsonSerializer.Serialize(kind) + ", " + JsonSerializer.Serialize(name) + ")");
+                if (mark.Length == 0 && step.Optional) continue;
+                if (mark.Length == 0)
+                {
+                    var what = kind == "press" ? "button" : kind == "choose" ? "choice (select or radio buttons)" : kind == "file" ? "file picker (<input type=\"file\">)" : "input field";
+                    failures.Add($"acceptance.control-missing:{scenario.Title}: there is no {what} named \"{name}\" on the screen. Label it with these words (button text, <label for>, aria-label or placeholder).");
+                    return failures;
+                }
+                var target = $"document.querySelector('[data-ls-scenario=\"{mark}\"]')";
+                error = kind switch
+                {
+                    // A chosen file: files[0] (name, size, text(), and FileReader.readAsText) holds the scenario's content.
+                    "file" => Run($$"""
+                        (function (content, name) {
+                          var el = {{target}};
+                          var f = { name: name, size: content.length, type: /\.csv$/i.test(name) ? 'text/csv' : 'text/plain', lastModified: 0, __ls_text: content,
+                                    text: function () { return Promise.resolve(content); } };
+                          var list = [f]; list.item = function (i) { return list[i] || null; };
+                          try { Object.defineProperty(el, 'files', { configurable: true, get: function () { return list; } }); }
+                          catch (e) { __ls_errors.push('the file could not be given to the picker: ' + e); return; }
+                          el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true }));
+                        })({{JsonSerializer.Serialize(step.Content ?? "")}}, {{JsonSerializer.Serialize(string.IsNullOrWhiteSpace(step.Value) ? "data.csv" : step.Value)}});
+                        """),
+                    "press" => Run($$"""(function () { var el = {{target}}; if (el.type === 'checkbox') { el.checked = !el.checked; el.dispatchEvent(new Event('click', { bubbles: true })); el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true })); return; } el.dispatchEvent(new Event('click', { bubbles: true, cancelable: true })); var type = (el.getAttribute('type') || 'submit').toLowerCase(); var form = el.closest ? el.closest('form') : null; if (form && type === 'submit') form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true })); })();"""),
+                    _ => Run($$"""
+                        (function (wanted) {
+                          var el = {{target}};
+                          var norm = function (s) { return String(s || '').replace(/\s/g, '').toLowerCase(); };
+                          if (el.tagName === 'SELECT') {
+                            var hit = null;
+                            for (var i = 0; i < el.options.length; i++) { var o = el.options[i]; if (norm(o.text) === norm(wanted) || norm(o.value) === norm(wanted)) { hit = o; break; } }
+                            if (!hit) for (var i = 0; i < el.options.length; i++) { var o = el.options[i]; if (norm(o.text).indexOf(norm(wanted)) >= 0) { hit = o; break; } }
+                            if (!hit) { __ls_errors.push('no option "' + wanted + '"'); return; }
+                            el.value = hit.value;
+                          } else if (el.type === 'radio' || el.type === 'checkbox') { el.checked = true; el.dispatchEvent(new Event('click', { bubbles: true })); }
+                          else el.value = wanted;
+                          el.dispatchEvent(new Event('input', { bubbles: true })); el.dispatchEvent(new Event('change', { bubbles: true }));
+                        })({{JsonSerializer.Serialize(step.Value ?? step.Option ?? "")}});
+                        """)
+                };
+                RunTimers(Run);
+            }
+            done.Add(step.Describe());
+            var errors = DrainErrors(document!).ToList();
+            if (error is not null) errors.Insert(0, Readable(error)!);
+            if (errors.Count > 0)
+            {
+                failures.Add($"acceptance.error:{scenario.Title}: after {string.Join(", ", done)}: {string.Join(" / ", errors.Take(2))}");
+                return failures;
+            }
+        }
+        var shown = VisibleText(document!);
+        var plain = NormalizeShown(shown);
+        bool Shows(string text) => text.Split('|').Select(NormalizeShown).Where(form => form.Length > 0).Any(form => plain.Contains(form, StringComparison.OrdinalIgnoreCase));
+        foreach (var expected in scenario.Expect.Where(text => !string.IsNullOrWhiteSpace(text)))
+            if (!Shows(expected))
+                failures.Add($"acceptance.failed:{scenario.Title}: after {scenario.Describe()}, the screen should show \"{expected}\" but it shows: {Shorten(shown, 240)}");
+        foreach (var unwanted in (scenario.Absent ?? []).Where(text => !string.IsNullOrWhiteSpace(text)))
+            if (Shows(unwanted))
+                failures.Add($"acceptance.failed:{scenario.Title}: after {scenario.Describe()}, the screen must not show \"{unwanted}\" any more, but it does: {Shorten(shown, 240)}");
+        // The file the app made for download (the last Blob), compared line by line as the user would open it.
+        if ((scenario.FileExpect ?? []).Count + (scenario.FileAbsent ?? []).Count > 0)
+        {
+            var made = Eval("__ls_blobs.length ? String(__ls_blobs[__ls_blobs.length - 1]) : '\\u0000none'");
+            if (made == "\0none")
+                failures.Add($"acceptance.failed:{scenario.Title}: after {scenario.Describe()}, no file was made for download (build it with new Blob([text]) and download it from a link)");
+            else
+            {
+                // "line:X" in fileAbsent: the line X at most once (duplicates removed); "line:" alone: no blank lines.
+                var lines = made.Replace("\r\n", "\n").TrimEnd('\n').Split('\n').Select(line => NormalizeShown(line)).ToArray();
+                var whole = NormalizeShown(made);
+                bool InFile(string text) => text.Split('|').Select(NormalizeShown).Where(form => form.Length > 0).Any(form => whole.Contains(form, StringComparison.OrdinalIgnoreCase));
+                foreach (var expected in (scenario.FileExpect ?? []).Where(text => !string.IsNullOrWhiteSpace(text)))
+                    if (!InFile(expected))
+                        failures.Add($"acceptance.failed:{scenario.Title}: the downloaded file should contain \"{expected}\" but it is: {Shorten(made, 240)}");
+                foreach (var unwanted in (scenario.FileAbsent ?? []).Where(text => !string.IsNullOrWhiteSpace(text)))
+                    if (unwanted.StartsWith("line:", StringComparison.Ordinal)
+                            ? lines.Count(line => line == NormalizeShown(unwanted[5..])) > (unwanted[5..].Length == 0 ? 0 : 1)
+                            : InFile(unwanted))
+                        failures.Add($"acceptance.failed:{scenario.Title}: the downloaded file must not contain {(unwanted.StartsWith("line:", StringComparison.Ordinal) ? $"the line \"{unwanted[5..]}\" more than once" : $"\"{unwanted}\"")}, but it is: {Shorten(made, 240)}");
+            }
+        }
+        return failures;
+    }
+
+    /// <summary>What the user reads: the app's text, the values in its fields and the chosen options.</summary>
+    private static string VisibleText(AngleSharp.Dom.IDocument document)
+    {
+        var app = document.GetElementById("app") ?? document.Body;
+        if (app is null) return "";
+        var values = app.QuerySelectorAll("input, textarea, select").Select(element =>
+            element is AngleSharp.Html.Dom.IHtmlInputElement input ? (input.Type is "checkbox" or "radio" ? "" : input.Value) :
+            element is AngleSharp.Html.Dom.IHtmlTextAreaElement area ? area.Value :
+            element is AngleSharp.Html.Dom.IHtmlSelectElement select ? select.SelectedOptions.FirstOrDefault()?.Text ?? "" : "");
+        return Regex.Replace(app.TextContent + " " + string.Join(" ", values), @"\s+", " ").Trim();
+    }
+
+    /// <summary>Text compared without spaces, digit grouping or full-width forms ("1,000 ｍ" and "1000m" are the same).</summary>
+    internal static string NormalizeShown(string text)
+    {
+        var halfWidth = new string(text.Select(ch => ch is >= '０' and <= '９' or >= 'Ａ' and <= 'Ｚ' or >= 'ａ' and <= 'ｚ' ? (char)(ch - 0xFEE0) : ch == '．' ? '.' : ch == '，' ? ',' : ch).ToArray());
+        var ungrouped = Regex.Replace(halfWidth, @"(?<=\d),(?=\d{3}\b)", "");
+        return Regex.Replace(ungrouped, @"\s+", "");
+    }
+
+    private static string Shorten(string text, int length) => text.Length <= length ? "\"" + text + "\"" : "\"" + text[..length] + "…\"";
 
     private static void RunTimers(Func<string, string?> run) =>
         // Each collected timer runs once (as if a moment passed); a timer that schedules itself does not loop.

@@ -211,6 +211,9 @@ public sealed class ConversationOrchestrator
     /// <summary>Where GAS hand-over zips are written (the user's Documents by default; a test root in drills).</summary>
     public string GasHandoverRoot { get; set; } = GasHandover.DefaultRoot;
 
+    /// <summary>Builds large plans in parts (core first, then one feature at a time by the agent loop); off when null.</summary>
+    public FeatureGrowth? Growth { get; init; }
+
     public event Action<ConversationMessage>? MessageAdded;
     public event Action<ProjectCreationProgress>? CreationProgress;
     public event Action<ConversationStage>? StageChanged;
@@ -1095,12 +1098,27 @@ public sealed class ConversationOrchestrator
         var progress = new Progress<ProjectCreationProgress>(item => CreationProgress?.Invoke(item));
         try
         {
-            var path = await _scaffolder.CreateAsync(Blueprint!, Kind!.Value, run.Token, progress, null, Request, inbox);
+            // Large plans: a working core first, then the agent loop adds the other features one at a time.
+            var (core, later) = Growth is not null && Kind is not StudioProjectKind.Agent ? FeatureGrowth.Split(Blueprint!) : (Blueprint!, []);
+            var path = await _scaffolder.CreateAsync(core, Kind!.Value, run.Token, progress, null, Request, inbox);
+            IReadOnlyList<FeatureGrowthResult> grown = [];
+            if (later.Count > 0)
+            {
+                // The core is saved and passed its checks; a stop or failure while adding keeps it and says what is missing.
+                try { grown = await Growth!.GrowAsync(path, Kind!.Value, Request, later, progress, run.Token); }
+                catch (Exception ex) when (ex is OperationCanceledException or InvalidOperationException or InvalidDataException or IOException or HttpRequestException && !cancellationToken.IsCancellationRequested)
+                {
+                    grown = later.Select(feature => new FeatureGrowthResult(feature, false, ex.Message, 0)).ToArray();
+                }
+                await FeatureGrowth.RecordResultsAsync(path, Blueprint!, grown, run.Token);
+            }
             await allNotices();
             ProjectPath = path;
             Stage = ConversationStage.Completed;
             var unapplied = inbox.Pending;
-            var completion = $"完成しました。保存先: {path}";
+            var completion = grown.Any(result => !result.Added)
+                ? $"基本部分を保存しましたが、追加要件の検証は完了していません。保存先: {path}" + FeatureGrowth.Describe(grown)
+                : $"完成しました。保存先: {path}" + FeatureGrowth.Describe(grown);
             if (Kind == StudioProjectKind.GoogleAppsScript)
                 completion += await HandOverGasAsync(path, 1, null, cancellationToken);
             if (unapplied.Count > 0)

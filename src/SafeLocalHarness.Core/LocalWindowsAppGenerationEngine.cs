@@ -83,6 +83,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         var requirements = blueprint.Features.Take(8)
             .Select((text, index) => new GeneratedRequirement($"LS-REQ-{index + 1:000}", text))
             .ToArray();
+        var tools = WindowsToolbox.For(string.Join(" ", blueprint.Name, blueprint.Summary, string.Join(" ", blueprint.Features), sourceRequest));
         var baseRequestJson = JsonSerializer.Serialize(new
         {
             output = kind == StudioProjectKind.WindowsGame ? "offline Windows game EXE" : "offline Windows desktop EXE",
@@ -90,7 +91,9 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
             blueprint.Summary,
             requirements,
             originalRequest = LimitSourceRequest(sourceRequest),
-            implementationConstraints = BuildImplementationConstraints(blueprint, kind)
+            implementationConstraints = BuildImplementationConstraints(blueprint, kind),
+            // Reviewed helpers the request needs (Excel workbooks, ...): the model calls them instead of writing file formats itself.
+            availableHelpers = tools.Select(tool => tool.Usage).ToArray()
         }, ModelPromptJson.Options);
         var requestJson = baseRequestJson;
         var instructions = new List<SteeringInstruction>();
@@ -98,21 +101,23 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         var checkpoint = await LoadCheckpointAsync(checkpointPath, cancellationToken);
         var failures = checkpoint?.Failures.ToArray() ?? [];
         var previousSource = checkpoint?.Source ?? "";
+        var lastSource = "";
         var tracePath = Path.Combine(_paths.LogRoot, $"windows-generation-{DateTime.UtcNow:yyyyMMddHHmmssfff}-{Guid.NewGuid():N}.jsonl");
 
         if (previousSource.Length > 0)
         {
+            previousSource = RemoveUnusedDuplicateInputControls(previousSource);
             previousSource = CollapseExcessBlankLines(
                 RepairTetrominoColorIndexing(
                     RepairUnsupportedKnownColorBrushes(
                         RepairRedundantTetrominoConstruction(
                             RemoveDuplicateExactPrivateFieldDeclarations(WindowsSourceAutoFix.Apply(previousSource).Source)))));
             failures = ValidateSource(previousSource)
-                .Concat(ValidateRequirementGrounding(previousSource, blueprint, kind))
+                .Concat(ValidateRequirementGrounding(previousSource, blueprint, kind, sourceRequest))
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             if (failures.Length == 0)
-                failures = await VerifyCompilationAsync(previousSource, blueprint, kind, requirements, cancellationToken);
+                failures = await VerifyCompilationAsync(previousSource, blueprint, kind, requirements, tools, cancellationToken);
             if (failures.Length == 0)
             {
                 await AppendTraceAsync(tracePath, 0, "accepted-checkpoint", previousSource, [], cancellationToken);
@@ -122,7 +127,8 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
                     new("Program.cs", Normalize(previousSource)),
                     new("app.manifest", WindowsApplicationManifest.Content),
                     new("requirements.json", BuildRequirements(blueprint, kind, requirements)),
-                    new("verification-plan.json", BuildVerificationPlan(requirements))
+                    new("verification-plan.json", BuildVerificationPlan(requirements)),
+                    .. WindowsToolbox.Files(tools)
                 ],
                 "generated-local-windows-executable");
             }
@@ -195,24 +201,38 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
                 throw new InvalidDataException("ローカルAIの応答が途中で終わったまま、試行の上限に達しました。プロジェクトは保存していません。", ex);
             }
 
-            var normalizedSource = CollapseExcessBlankLines(
+            var normalizedSource = RemoveUnusedDuplicateInputControls(
+                AddSafeFrameworkUsings(WindowsSourceAutoFix.Apply(UnwrapWholeSourceFence(candidate.ProgramCs)).Source));
+            normalizedSource = CollapseExcessBlankLines(
                 RepairTetrominoColorIndexing(
                     RepairUnsupportedKnownColorBrushes(
                         RepairRedundantTetrominoConstruction(
-                            RemoveDuplicateExactPrivateFieldDeclarations(
-                                AddSafeFrameworkUsings(WindowsSourceAutoFix.Apply(UnwrapWholeSourceFence(candidate.ProgramCs)).Source))))));
+                            RemoveDuplicateExactPrivateFieldDeclarations(normalizedSource)))));
             var repeatedWithoutChange = previousSource.Length > 0 &&
                 string.Equals(Normalize(previousSource), Normalize(normalizedSource), StringComparison.Ordinal);
             previousSource = normalizedSource;
+            lastSource = normalizedSource;
             failures = ValidateSource(normalizedSource)
-                .Concat(ValidateRequirementGrounding(normalizedSource, blueprint, kind))
+                .Concat(ValidateRequirementGrounding(normalizedSource, blueprint, kind, sourceRequest))
                 .Concat(repeatedWithoutChange ? ["repair.no-change: the previous rejected source was returned without a fix"] : [])
                 .Distinct(StringComparer.Ordinal)
                 .ToArray();
             if (failures.Length == 0)
             {
                 progress?.Report(new("compile-check", $"Windows EXEとして実コンパイルしています（{attempt}/{MaxAttempts}回）", fraction + 0.05));
-                failures = await VerifyCompilationAsync(normalizedSource, blueprint, kind, requirements, cancellationToken);
+                failures = await VerifyCompilationAsync(normalizedSource, blueprint, kind, requirements, tools, cancellationToken);
+                // Compiler errors with a standard fix (array ↔ List, a struct member through a property) are fixed here
+                // instead of being sent back to the model, which repeated them to the end (catalogue 2026-10-20).
+                for (var round = 0; round < 3 && failures.Length == 1 && failures[0].StartsWith("compile.failed:", StringComparison.Ordinal); round++)
+                {
+                    if (CompileErrorFixes.Apply(normalizedSource, failures[0]) is not { } compileFixed) break;
+                    progress?.Report(new("auto-fix", "コンパイルエラーを決まった直し方で修正しています", fraction + 0.06));
+                    normalizedSource = AddSafeFrameworkUsings(compileFixed);
+                    previousSource = normalizedSource;
+                    lastSource = normalizedSource;
+                    failures = ValidateSource(normalizedSource).Concat(ValidateRequirementGrounding(normalizedSource, blueprint, kind, sourceRequest)).Distinct(StringComparer.Ordinal).ToArray();
+                    if (failures.Length == 0) failures = await VerifyCompilationAsync(normalizedSource, blueprint, kind, requirements, tools, cancellationToken);
+                }
             }
 
             if (failures.Length == 0)
@@ -225,7 +245,8 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
                     new("Program.cs", Normalize(normalizedSource)),
                     new("app.manifest", WindowsApplicationManifest.Content),
                     new("requirements.json", BuildRequirements(blueprint, kind, requirements)),
-                    new("verification-plan.json", BuildVerificationPlan(requirements))
+                    new("verification-plan.json", BuildVerificationPlan(requirements)),
+                    .. WindowsToolbox.Files(tools)
                 ],
                 "generated-local-windows-executable");
             }
@@ -239,7 +260,19 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
                 progress?.Report(new("candidate-rejected", "検出した問題をローカルAIへ戻して作り直します: " + string.Join(", ", failures.Take(2)), fraction + 0.07));
         }
 
-        throw new InvalidDataException("自律修復を上限まで行いましたが、安全にコンパイルできませんでした。途中成果物は保存していません。検出内容: " + string.Join(", ", failures.Take(4)));
+        var exhausted = "自律修復を上限まで行いましたが、安全にコンパイルできませんでした。途中成果物は保存していません。検出内容: " + string.Join(", ", failures.Take(4));
+        // The last source goes to the agent loop (when the scaffolder has one), which repairs it with exact edits.
+        if (lastSource.Length > 0)
+            throw new InvalidDataException(exhausted, new GenerationExhaustedException(exhausted, new GeneratedProjectSource(
+                [
+                    new("Program.cs", Normalize(lastSource)),
+                    new("app.manifest", WindowsApplicationManifest.Content),
+                    new("requirements.json", BuildRequirements(blueprint, kind, requirements)),
+                    new("verification-plan.json", BuildVerificationPlan(requirements)),
+                    .. WindowsToolbox.Files(tools)
+                ],
+                "generated-local-windows-executable"), failures.Select(ExplainFailure).ToArray()));
+        throw new InvalidDataException(exhausted);
     }
 
     /// <summary>
@@ -281,7 +314,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
             Implement one complete Japanese Windows Forms application as a single Program.cs compatible with the Windows .NET Framework compiler (C# 5.0 or earlier).
 
             Mandatory boundaries:
-            - Use only System, System.Collections.Generic, System.Drawing, System.IO, System.Text and System.Windows.Forms APIs.
+            - Use only System, System.Collections.Generic, System.Drawing, System.IO, System.Text and System.Windows.Forms APIs, plus the helper classes listed in availableHelpers (they are already in the project).
             - Include [STAThread], Application.EnableVisualStyles(), Application.Run(...), and a Form subclass.
             - Use code-created controls; do not require designer files, packages, downloads, assets, commands, scripts or build tools.
               There is no Form1.Designer.cs: never write "partial class" or call InitializeComponent. Declare every control as a field and create, place and Controls.Add it in the constructor.
@@ -289,6 +322,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
             - Implement every requested feature. Games must have visible rendering, keyboard controls, a timer/game loop, score or progress, game-over and restart.
             - Use no network, Process, shell, registry, reflection, P/Invoke, unsafe, dynamic code, WebBrowser, external URLs or administrator-only locations.
             - If persistence is required, store only below Environment.SpecialFolder.LocalApplicationData. Never use absolute paths or parent traversal.
+            - Files and folders the user works on are chosen by the user with OpenFileDialog, SaveFileDialog or FolderBrowserDialog. Never delete files or folders; write results to new files.
             - Do not include markdown fences, TODOs, placeholders, tests, explanations or claims of completion.
             - Keep the complete source under 12,000 characters. Prefer cohesive Form methods and small domain structures over one giant event handler.
             """;
@@ -558,7 +592,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         return count;
     }
 
-    private static string ExplainFailure(string failure)
+    internal static string ExplainFailure(string failure)
     {
         var explanation = failure switch
         {
@@ -575,21 +609,56 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
             "source.windows-entrypoint" => "Add one [STAThread] static void Main entry point that calls Application.Run with a Form subclass.",
             "source.interactive" => "Add event handlers and a Timer or OnPaint-driven interactive loop.",
             "source.invalid-format-or-unicode" => "Return plain valid C# source without markdown fences, replacement characters, or control characters.",
+            "source.invalid-format-or-unicode:markdown-fence" => "The source contains a markdown fence (three backticks). Return only C# code, with no fences and no explanation.",
+            "source.invalid-format-or-unicode:replacement-character" => "The source contains the broken character U+FFFD (a lost character). Write that text again in plain Japanese or ASCII.",
+            "source.invalid-format-or-unicode:control-character" => "The source contains a control character. Remove it; use \\n inside strings for line breaks.",
             "source.missing-or-too-large" => $"Return a complete Program.cs no longer than {MaxSourceCharacters:N0} characters.",
             "source.csharp5-compatibility" => "The Windows compiler supports C# 5.0. Replace interpolated strings ($\"...\") with concatenation or string.Format and avoid newer syntax.",
             "security.forbidden-api" => "Remove all network, process, shell, registry, reflection, P/Invoke, unsafe, dynamic, WebBrowser, URL, and parent-path APIs.",
-            "security.user-storage-only" => "If files are used, build their path below Environment.SpecialFolder.LocalApplicationData.",
+            _ when failure.StartsWith("security.forbidden-api:", StringComparison.Ordinal) =>
+                "Remove the forbidden API \"" + failure["security.forbidden-api:".Length..] + "\" (no network, process start, shell, registry, reflection, P/Invoke, unsafe, dynamic, WebBrowser, URLs or parent paths). Ordinary method names are fine.",
+            "security.user-storage-only" => "If files are used, either let the user pick them with OpenFileDialog, SaveFileDialog or FolderBrowserDialog, or build the app's own path below Environment.SpecialFolder.LocalApplicationData.",
+            "generated.user-storage-only" => "If files are used, either let the user pick them with OpenFileDialog, SaveFileDialog or FolderBrowserDialog, or build the app's own path below Environment.SpecialFolder.LocalApplicationData. Never delete files.",
+            "security.no-delete" => "Do not delete files or folders (File.Delete, Directory.Delete). Write results to a new file or move items into a new folder instead.",
             _ when failure.StartsWith("exe.input-overwritten", StringComparison.Ordinal) => "When the app was used, text typed into an input disappeared or changed within seconds. Do not overwrite input boxes from a Timer or other handler unless the user asked; only set their Text when loading or clearing.",
             _ when failure.StartsWith("exe.internal-caption", StringComparison.Ordinal) => "A button shows a code name (" + failure.Split(':')[1] + "). Set every button's Text to a short Japanese caption such as 開く, 保存 or もう一度.",
             _ when failure.StartsWith("exe.not-kept", StringComparison.Ordinal) => "Typed content was gone after closing and opening the app again. Save it to a file under Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData) in FormClosing (and when saving), and load it in the constructor or Load.",
             _ when failure.StartsWith("exe.click-error", StringComparison.Ordinal) || failure.StartsWith("exe.start-error", StringComparison.Ordinal) => "Using the app raised an error: " + failure + ". Make that handler work with the controls and values that exist.",
             _ when failure.StartsWith("exe.start-exit", StringComparison.Ordinal) || failure.StartsWith("exe.no-window", StringComparison.Ordinal) => "The app closed or showed no window when started. Main must run Application.Run(new YourForm()) once, and the form must not close itself on start.",
             _ when failure.StartsWith("exe.click-exit", StringComparison.Ordinal) => "Pressing a button that is not an exit button closed the app: " + failure + ". Do not call Close or Application.Exit there.",
+            _ when failure.StartsWith("exe.duplicate-input-concept", StringComparison.Ordinal) => "Two editable controls represent the same field. Keep one suitable control (for a date, prefer one DateTimePicker) and remove the redundant input. If they are genuinely different fields, give them distinct names and labels such as startDate and endDate.",
             _ when failure.StartsWith("repair.no-change", StringComparison.Ordinal) => "The rejected source was returned unchanged. Make the requested concrete code changes now.",
             _ => failure
         };
         // Names the compiler cannot find (CS0103) are named first, with how to declare them: given only the error lines,
         // the model returned the same source again (trial 2026-10-13: boardSize, buttonCells).
+        // "new Button { FlatAppearance.BorderSize = 0 }" (CS0747, memory game 2026-10-19): nested settings go after creation.
+        if (failure.Contains("CS0747", StringComparison.Ordinal))
+            explanation = "In an object initializer { } only direct properties can be set (Text = ..., Width = ...); set nested ones after the object is created, e.g. button.FlatAppearance.BorderSize = 0; on its own line. " + explanation;
+        // "new Button { Click += OnClick }" (CS1913, drawing app 2026-10-19): events are attached after creation.
+        if (failure.Contains("CS1913", StringComparison.Ordinal))
+            explanation = "Events cannot be set inside an object initializer { }. Create the control first, then attach the event on its own line: button.Click += OnClick; trackBar.ValueChanged += OnValueChanged; " + explanation;
+        // Tuples "(string, int)" are C# 7; the Windows compiler is C# 5 (CS1031 "Type expected", bar chart 2026-10-19).
+        if (failure.Contains("CS1031", StringComparison.Ordinal) || Regex.IsMatch(failure, @"CS1519: Invalid token '\('"))
+            explanation = "C# 5 has no tuples such as List<(string, int)> or (string name, int value). Use KeyValuePair<string, int>, or a small class with fields (class Bar { public string Name; public int Value; }). " + explanation;
+        // Two members with one name (CS0102, bar chart 2026-10-20): keep one declaration.
+        if (failure.Contains("CS0102", StringComparison.Ordinal) && Regex.Match(failure, @"already contains a definition for '(?<name>\w+)'") is { Success: true } duplicate)
+            explanation = "The class declares '" + duplicate.Groups["name"].Value + "' twice. Keep one declaration (one type, one initial value) and delete the other line; a method and a field cannot share a name either. " + explanation;
+        // Statements written straight into the class body (CS1519 on '{' or '=', invoice 2026-10-20).
+        if (Regex.IsMatch(failure, @"CS1519: Invalid token '[{=]'"))
+            explanation = "Some code is written directly in the class, outside any method (around the line in the error). Statements and blocks must be inside a method or the constructor; at class level only declare fields (private int total;), methods and nested classes. Check that every method's braces { } are closed. " + explanation;
+        // Types from outside libraries (CS0246, e.g. DocumentFormat.OpenXml in an invoice, 2026-10-20).
+        if (failure.Contains("CS0246", StringComparison.Ordinal))
+            explanation = "Only the .NET Framework built into Windows is available (System, System.Drawing, System.Windows.Forms, System.IO, System.Linq, System.Xml). No OpenXml, Office interop or NuGet packages: read and write Excel files with XlsxLite, print with System.Drawing.Printing.PrintDocument, and save text with File.WriteAllText. " + explanation;
+        // A method left open: the next member's 'private' is read as a statement (CS1525 'private' / CS1513, memory game 2026-10-20).
+        if (Regex.IsMatch(failure, @"CS1525: Invalid expression term '(private|public|protected|internal|static|void)'") || failure.Contains("CS1513", StringComparison.Ordinal))
+            explanation = "A method is not closed: the method that ends just before the line in the error is missing its closing brace }. Count the { and } of that method and add the missing } before the next member. " + explanation;
+        // APIs of newer .NET that the Windows compiler (.NET Framework 4) does not have (memory game, 2026-10-19).
+        if (failure.Contains("CS1061", StringComparison.Ordinal) && failure.Contains("'Shuffle'", StringComparison.Ordinal))
+            explanation = "Random.Shuffle does not exist in .NET Framework. Shuffle yourself: for (int i = items.Length - 1; i > 0; i--) { int j = random.Next(i + 1); var t = items[i]; items[i] = items[j]; items[j] = t; } " + explanation;
+        // Rows from XlsxLite are string[]; the model kept assigning them to List<string> (CS0029, Excel merge 2026-10-19).
+        if (failure.Contains("CS0029", StringComparison.Ordinal) && failure.Contains("'string[]'", StringComparison.Ordinal) && failure.Contains("List<string>", StringComparison.Ordinal))
+            explanation = "XlsxLite.ReadSheet returns List<string[]>: each row is a string[] (use row.Length and row[i]); to change a row's cells, copy it with new List<string>(row), and give WriteSheet rows as string[] (list.ToArray()). " + explanation;
         var undeclared = Regex.Matches(failure, @"CS0103: The name '(?<name>\w+)'").Select(match => match.Groups["name"].Value).Distinct().ToArray();
         if (undeclared.Length > 0)
             explanation = "Declare these names as fields of the Form before using them: " + string.Join(", ", undeclared) +
@@ -619,22 +688,476 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         var errors = new List<string>();
         Check(!string.IsNullOrWhiteSpace(source) && source.Length <= MaxSourceCharacters, "source.missing-or-too-large", errors);
         if (errors.Count > 0) return errors;
-        Check(!source.Contains("```", StringComparison.Ordinal) && !source.Contains('\uFFFD') && !LocalWebAppGenerationEngine.HasForbiddenControlCharacters(source), "source.invalid-format-or-unicode", errors);
+        // Said separately, so the repair knows what to remove (one combined name gave the model nothing to act on).
+        if (source.Contains("```", StringComparison.Ordinal)) errors.Add("source.invalid-format-or-unicode:markdown-fence");
+        if (source.Contains('\uFFFD')) errors.Add("source.invalid-format-or-unicode:replacement-character");
+        if (LocalWebAppGenerationEngine.HasForbiddenControlCharacters(source)) errors.Add("source.invalid-format-or-unicode:control-character");
         Check(!source.Contains("$\"", StringComparison.Ordinal) &&
               !source.Contains("$@\"", StringComparison.Ordinal) &&
               !source.Contains("@$\"", StringComparison.Ordinal), "source.csharp5-compatibility", errors);
         Check(source.Contains("[STAThread]", StringComparison.Ordinal) && source.Contains("Application.Run", StringComparison.Ordinal) && source.Contains(": Form", StringComparison.Ordinal), "source.windows-entrypoint", errors);
-        Check(source.Contains("+=", StringComparison.Ordinal) && (source.Contains("Timer", StringComparison.Ordinal) || source.Contains("OnPaint", StringComparison.Ordinal) || source.Contains(".Click", StringComparison.Ordinal) || source.Contains("KeyDown", StringComparison.Ordinal)), "source.interactive", errors);
-        var forbidden = new[] { "System.Net", "HttpClient", "WebClient", "Process", "System.Diagnostics", "Registry", "Microsoft.Win32", "DllImport", "System.Reflection", "Assembly.Load", "unsafe", "dynamic", "WebBrowser", "runas", "cmd.exe", "powershell", "http://", "https://", "..\\" };
-        Check(forbidden.All(token => !source.Contains(token, StringComparison.OrdinalIgnoreCase)), "security.forbidden-api", errors);
+        Check(IsInteractive(source), "source.interactive", errors);
+        // Matched as API names, not as any substring: a method named ProcessFiles was refused as "Process" four times
+        // running, and the model could not tell what to remove (Excel merge, catalogue 2026-10-19). The name found is
+        // reported so the repair knows what to change.
+        var found = ForbiddenApi.Select(rule => Regex.Match(source, rule, RegexOptions.CultureInvariant)).FirstOrDefault(match => match.Success);
+        if (found is not null) errors.Add("security.forbidden-api:" + found.Value.Trim());
         var usesFileSystem = source.Contains("File.", StringComparison.Ordinal) || source.Contains("Directory.", StringComparison.Ordinal);
-        Check(!usesFileSystem || source.Contains("Environment.SpecialFolder.LocalApplicationData", StringComparison.Ordinal), "security.user-storage-only", errors);
+        // Files go to the app's own folder, or to files and folders the user picks in a dialog (merging 50 workbooks or
+        // sorting a folder needs the user's own files, 2026-10-19). Deleting stays out: generated apps never remove files.
+        var userPicks = source.Contains("OpenFileDialog", StringComparison.Ordinal) || source.Contains("SaveFileDialog", StringComparison.Ordinal) ||
+                        source.Contains("FolderBrowserDialog", StringComparison.Ordinal);
+        Check(!usesFileSystem || userPicks || source.Contains("Environment.SpecialFolder.LocalApplicationData", StringComparison.Ordinal), "security.user-storage-only", errors);
+        Check(!Regex.IsMatch(source, @"\b(File|Directory)\.Delete\s*\(|\.Delete\s*\(\s*(true)?\s*\)"), "security.no-delete", errors);
         return errors;
     }
+
+    /// <summary>
+    /// Requirements a Windows app can only meet with a particular mechanism. A "desktop watcher" was built with no timer
+    /// and no dates and passed every check (catalogue 2026-10-19): the words were there, the mechanism was not.
+    /// </summary>
+    private static readonly (Regex Asks, Regex Uses, string Name, string Hint)[] Mechanisms =
+    [
+        (new("監視|見張|定期的|一定時間ごと|自動で(確認|チェック|探)|常に(確認|チェック)"), new(@"\bTimer\b|FileSystemWatcher"),
+         "watch", "watch with a System.Windows.Forms.Timer (Interval in ms, Tick += handler, Start()) or a FileSystemWatcher on a folder the user picks"),
+        (new("日付|締め切り|締切|期限|予定|カレンダー"), new(@"\bDateTime\b|\bDateTimePicker\b|MonthCalendar"),
+         "date", "read and compare dates with DateTime (DateTime.TryParse, DateTime.Today) or let the user pick them with a DateTimePicker"),
+        (new("保存|記録して|残る|残す|次回も|閉じても"), new(@"File\.(Write|Append)All(Text|Lines)|StreamWriter|XlsxLite\.Write|\.Save\("),
+         "persist", "save with File.WriteAllText to a file below Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), or to a file the user picks with SaveFileDialog"),
+        (new("印刷|プリント"), new(@"PrintDocument|PrintDialog|PrintPreviewDialog"),
+         "print", "print with a PrintDocument (PrintPage += handler drawing with e.Graphics) and a PrintDialog"),
+        (new("音を(鳴ら|出)|鳴らす|鳴る|アラーム|ビープ|効果音"), new(@"SystemSounds|SoundPlayer|Console\.Beep"),
+         "sound", "make the sound with System.Media.SystemSounds.Beep.Play() or SystemSounds.Asterisk.Play()"),
+        // A folder sorter that only listed the files and moved nothing passed (catalogue 2026-10-19).
+        (new("振り分け|仕分け|移動|整理|名前を変え|名前を付け(?!て保存)|リネーム|改名"), new(@"File\.Move|Directory\.Move|FileInfo\b[^;]*\.MoveTo|\.MoveTo\s*\("),
+         "move", "move or rename each file with File.Move(source, destination) (create the destination folder first with Directory.CreateDirectory); never delete files"),
+        (new("エクセル|Excel|xlsx", RegexOptions.IgnoreCase), new(@"XlsxLite\."),
+         "excel", "read and write the workbooks with the XlsxLite helper (XlsxLite.ReadSheet, XlsxLite.WriteSheet)"),
+        // Requests the catalogue saw shipped without the thing they asked for (2026-10-20): entering by ticking, totals per
+        // month, drawing by tracing with the mouse.
+        (new("チェックで|チェックを(入れ|付け)|チェックボックス|チェック欄"), new(@"\bCheckBox\b|CheckedListBox|DataGridViewCheckBoxColumn"),
+         "checkbox", "let the user tick with CheckBox controls (or a CheckedListBox / DataGridViewCheckBoxColumn) and read .Checked"),
+        (new("月ごと|月別|月毎|毎月の|月単位"), new(@"\.Month\b|MonthCalendar|""yyyy[/\-年]?M"),
+         "month", "group the records by month (date.Year and date.Month, or date.ToString(\"yyyy/MM\")) and show each month's totals separately"),
+        (new("なぞって|お絵かき|手書き|線を描|絵を描"), new(@"DrawLine|DrawLines|DrawCurve|DrawBezier|AddLine|FillEllipse"),
+         "draw", "draw with e.Graphics.DrawLine(pen, lastPoint, e.Location) in MouseMove while the button is down, keep the strokes in a Bitmap or a list and repaint them"),
+        // A renamer that chose the names itself (random ones) and gave the user nothing to set (hands-on 2026-10-21).
+        (new("連番|日付を(付|つ)け|名前を変え|名前を付け(?!て保存)|リネーム|改名"), new(@"\b(TextBox|NumericUpDown|ComboBox|RadioButton|MaskedTextBox)\b"),
+         "rename-rule", "let the user set the naming rule (a TextBox for the prefix, a NumericUpDown for the first number, a ComboBox or CheckBox for adding today's date) and show old → new names before renaming"),
+        // Renaming is destructive even when it is user-requested. Merely having File.Move is not enough: a collision can
+        // leave half the folder renamed. Require a preflight and a compensating rollback path (run 19, 2026-10-27).
+        (new("(?:ファイル)?名.{0,16}変え|名前を付け(?!て保存)|リネーム|改名|連番.{0,16}(ファイル|名前)|(?:ファイル|名前).{0,16}連番"),
+         new(@"(?s)(?=.*\bFile\.Exists\s*\()(?=.*\btry\s*\{)(?=.*\bcatch\b)(?=.*\bFile\.Move\s*\()"),
+         "rename-safety", "before changing anything, reject duplicate destinations and existing destination files with File.Exists; then apply the complete preview inside try/catch, record each completed move, and move completed files back in reverse order if one operation fails"),
+        // A row-level merge is different from preserving each workbook as a separate worksheet. The latter passed while
+        // the requested school-name column and combined response rows were absent (run 19, 2026-10-27).
+        (new("(学校|部署|店舗|拠点|ファイル).{0,16}(名|名前).{0,8}列.{0,30}(まとめ|統合)|列を(付け|追加).{0,30}(まとめ|統合)"),
+         new(@"XlsxLite\.ReadSheet\s*\("),
+         "excel-row-aggregation", "read every source workbook with XlsxLite.ReadSheet, build one output row list, add the source name as a real cell in every data row, and write that list with XlsxLite.WriteSheet; CombineSheets alone only keeps separate worksheets and is not row aggregation"),
+        // A PDF editor that only showed messages or drew on a picture of the page would look done (指示書 2026-10-20).
+        (new("PDF", RegexOptions.IgnoreCase), new(@"PdfLite\.Open"),
+         "pdf", "open the PDF with PdfLite.Open(path) and change it with doc.ReplaceText / doc.ReplaceTextWithFont / doc.SetRuleThickness / doc.MoveRule / doc.RotatePage, then doc.Save(newPath)")
+    ];
+
+    /// <summary>
+    /// Shapes of a false success found in built apps that compiled and "passed" (catalogue audit 2026-10-20): inputs
+    /// created but never put on the form, buttons disabled for good, files renamed the moment a folder is picked (before
+    /// any confirmation), buttons whose handler only shows a message, and lines drawn from a point to the same point.
+    /// </summary>
+    internal static IReadOnlyList<string> FalseSuccessShapes(string source)
+    {
+        var findings = new List<string>();
+        var code = Regex.Replace(source, @"/\*[\s\S]*?\*/|//[^\n]*", "", RegexOptions.CultureInvariant);
+        // Controls made but never added to a form or panel (or handed to a helper that adds them).
+        foreach (Match made in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?(?<type>TextBox|ComboBox|ListBox|ListView|Button|NumericUpDown|DateTimePicker|CheckBox|DataGridView|TrackBar|RadioButton)\s*[({]", RegexOptions.CultureInvariant))
+        {
+            var name = Regex.Escape(made.Groups["name"].Value);
+            var placed = Regex.IsMatch(code, @"Controls\.Add(?:Range)?\s*\([^;]*\b" + name + @"\b", RegexOptions.CultureInvariant) ||
+                         Regex.IsMatch(code, @"[(,]\s*" + name + @"\s*[,)]", RegexOptions.CultureInvariant) ||
+                         Regex.IsMatch(code, @"\b" + name + @"\.Parent\s*=", RegexOptions.CultureInvariant);
+            if (!placed)
+                findings.Add($"exe.control-not-on-screen:{made.Groups["name"].Value}: the {made.Groups["type"].Value} \"{made.Groups["name"].Value}\" is created but never added to the form (Controls.Add({made.Groups["name"].Value}) is missing), so the user cannot see or use it");
+        }
+        // Disabled and never enabled again.
+        foreach (Match disabled in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\.Enabled\s*=\s*false\s*;", RegexOptions.CultureInvariant))
+        {
+            var name = disabled.Groups["name"].Value;
+            // A card, cell or item reached through a loop or the clicked sender is disabled on purpose (matched cards in a
+            // memory game, 2026-10-20); only a control the form keeps (a field or a control it creates by name) counts.
+            var perItem = Regex.IsMatch(code, @"foreach\s*\(\s*(?:var|\w+)\s+" + Regex.Escape(name) + @"\s+in\b|\b" + Regex.Escape(name) + @"\s*=\s*(?:\(\s*\w+\s*\)\s*sender\b|sender\s+as\b)", RegexOptions.CultureInvariant);
+            if (!perItem && !Regex.IsMatch(code, @"\b" + Regex.Escape(name) + @"\.Enabled\s*=(?!\s*false\b)[^;]+;", RegexOptions.CultureInvariant))
+                findings.Add($"exe.never-enabled:{name}: \"{name}\" is disabled and nothing enables it again, so once disabled it can never be used (a timer's start button stayed dead after the first countdown, 2026-10-20); set {name}.Enabled = true when it becomes usable again (for example when the timer stops)");
+        }
+        foreach (var method in Methods(code))
+        {
+            // Files changed in the same handler that picks the folder, with no question asked first.
+            if (Regex.IsMatch(method.Body, @"FolderBrowserDialog|OpenFileDialog", RegexOptions.CultureInvariant) &&
+                Regex.IsMatch(method.Body, @"File\.(Move|Copy|Replace)|Directory\.Move|\.MoveTo\s*\(", RegexOptions.CultureInvariant) &&
+                !Regex.IsMatch(method.Body, @"MessageBoxButtons\.(YesNo|OKCancel)|DialogResult\.(Yes|No)\b", RegexOptions.CultureInvariant))
+                findings.Add($"exe.changes-before-confirm:{method.Name}: files are moved or renamed in the same handler that picks the folder, before the user has seen or confirmed the plan; list the planned changes there, and change files only when the user presses a confirm button (or answers Yes to a MessageBox with MessageBoxButtons.YesNo)");
+            // A button handler that only shows a message (or only sets a fixed text) does nothing its caption promises.
+            var statements = method.Body.Split(';', StringSplitOptions.RemoveEmptyEntries).Select(part => part.Trim().Trim('{', '}').Trim()).Where(part => part.Length > 0).ToArray();
+            if (method.Name.EndsWith("_Click", StringComparison.Ordinal) && statements.Length is > 0 and <= 2 &&
+                statements.All(statement => Regex.IsMatch(statement, @"^(MessageBox\.Show\s*\(|[\w.]+\.Text\s*=\s*""[^""]*""$)", RegexOptions.CultureInvariant)))
+                findings.Add($"exe.stub-handler:{method.Name}: the button only shows a message; make it do what its caption says");
+        }
+        findings.AddRange(UsabilityShapes(code));
+        // CombineSheets returns a warning list describing content that could not be copied. Ignoring it produces a false
+        // success message. Passing a freshly-created empty summary list also creates an empty summary sheet.
+        if (Regex.IsMatch(code, @"(?:^|[;{}])\s*XlsxLite\.CombineSheets\s*\(", RegexOptions.CultureInvariant))
+            findings.Add("excel.combine-result-ignored: XlsxLite.CombineSheets returns copy warnings, but this call discards them; assign the return value and show every warning to the user instead of reporting unconditional success");
+        if (Regex.IsMatch(code, @"XlsxLite\.CombineSheets\s*\([^;]*new\s+List\s*<\s*string\s*\[\s*\]\s*>\s*\(\s*\)", RegexOptions.CultureInvariant))
+            findings.Add("excel.empty-summary: CombineSheets receives a new empty List<string[]> for the summary, so the summary sheet is guaranteed to be empty; populate one row per source record (including the source-name column) before writing it");
+        // Data gathered in a loop and then dropped: an Excel merge read 50 workbooks into a list and wrote only list[0], and
+        // filled a list of school names that nothing read (catalogue 2026-10-20).
+        foreach (Match list in Regex.Matches(code, @"\b(?:var|List<[^=;]+>|IList<[^=;]+>)\s+(?<name>[A-Za-z_]\w*)\s*=\s*new\s+List<", RegexOptions.CultureInvariant))
+        {
+            var name = Regex.Escape(list.Groups["name"].Value);
+            var all = Regex.Matches(code, @"\b" + name + @"\b(?<after>\s*(?:\.\s*(?<member>\w+)|\[\s*(?<index>[^\]]*)\]))?", RegexOptions.CultureInvariant)
+                .Where(use => use.Index != list.Groups["name"].Index).ToArray();
+            var adds = all.Count(use => use.Groups["member"].Value is "Add" or "AddRange" or "Insert");
+            if (adds == 0) continue;
+            var reads = all.Where(use => use.Groups["member"].Value is not ("Add" or "AddRange" or "Insert" or "Clear")).ToArray();
+            if (reads.Length == 0)
+                findings.Add($"exe.collected-unused:{list.Groups["name"].Value}: \"{list.Groups["name"].Value}\" is filled but never used, so what was gathered never reaches the result; use it (for example write it as a column) or remove it");
+            else if (reads.Any(use => use.Groups["index"].Value.Trim() == "0") &&
+                     reads.All(use => use.Groups["index"].Value.Trim() == "0" || use.Groups["member"].Value is "Count" or "Length"))
+                findings.Add($"exe.only-first:{list.Groups["name"].Value}: everything gathered into \"{list.Groups["name"].Value}\" is collected, but only {list.Groups["name"].Value}[0] is used, so all but the first are dropped; go through every item with foreach");
+        }
+        // A line from a point to the same point draws a dot (a drawing app, 2026-10-20).
+        if (Regex.IsMatch(code, @"DrawLine\s*\([^,]+,\s*(?<x>[\w.]+)\s*,\s*(?<y>[\w.]+)\s*,\s*\k<x>\s*,\s*\k<y>\s*\)", RegexOptions.CultureInvariant))
+            findings.Add("exe.draw-dots: DrawLine goes from a point to the same point, so moving the mouse draws only dots; keep the previous point (lastPoint) and draw from it to the new one, then remember the new one");
+        return findings.Distinct().ToArray();
+    }
+
+    /// <summary>
+    /// What made built apps unusable although they ran (hands-on 2026-10-21): five input boxes without a single label (a
+    /// daily report), button captions squeezed into the default 75-pixel button, English messages in a Japanese app,
+    /// files renamed to random names, and a rename button that failed when pressed again because its list still held
+    /// the old names.
+    /// </summary>
+    internal static IReadOnlyList<string> UsabilityShapes(string code)
+    {
+        var findings = new List<string>();
+        string StatementAt(int index) { var end = code.IndexOf(';', index); return end < 0 ? code[index..] : code[index..end]; }
+        string? Assigned(string name, string member) =>
+            Regex.Match(code, @"\b" + Regex.Escape(name) + @"\." + member + @"\s*=\s*(?<v>[^;]+);", RegexOptions.CultureInvariant) is { Success: true } direct ? direct.Groups["v"].Value : null;
+
+        // Inputs the user types or picks into, without a label to say what goes where.
+        var inputs = Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?(?<type>TextBox|ComboBox|NumericUpDown|DateTimePicker|MaskedTextBox)\s*[({]", RegexOptions.CultureInvariant)
+            .Where(made => !Regex.IsMatch(StatementAt(made.Index) + " " + (Assigned(made.Groups["name"].Value, "ReadOnly") ?? ""), @"ReadOnly\s*=\s*true|^\s*true\s*$", RegexOptions.CultureInvariant))
+            .Select(made => made.Groups["name"].Value).Distinct().ToList();
+        var labels = Regex.Matches(code, @"new\s+(?:System\.Windows\.Forms\.)?(?:Label|GroupBox)\s*[({]", RegexOptions.CultureInvariant).Count;
+        // Labels made by a helper or a loop ("AddRow(\"名前\", nameBox)") label several inputs with one "new Label".
+        var helperLabels = Regex.IsMatch(code, @"new\s+(?:System\.Windows\.Forms\.)?Label\s*(?:\(\s*\))?\s*\{[^}]*Text\s*=\s*[A-Za-z_]\w*\s*[,}]", RegexOptions.CultureInvariant) ||
+                           Regex.IsMatch(code, @"\.Text\s*=\s*(?!"")[A-Za-z_]\w*(?:\[[^\]]+\])?\s*;[^;]*Label", RegexOptions.CultureInvariant);
+        var paired = inputs.Count(name => Regex.IsMatch(code, @"\(\s*""[^""]+""\s*,\s*" + Regex.Escape(name) + @"\s*[,)]", RegexOptions.CultureInvariant));
+        if (inputs.Count > 0 && !helperLabels && labels + paired < inputs.Count)
+            findings.Add($"exe.unlabeled-inputs: {inputs.Count} input boxes ({string.Join(", ", inputs.Take(6))}) but only {labels + paired} label(s), so the user cannot tell what goes where; put a Label with a short Japanese caption (日付, やったこと, …) before or above each input, for example in a TableLayoutPanel with two columns");
+
+        // A failed daily-report repair created both dateTextBox and datePicker for one date. Asking for another label
+        // kept the redundant field and sent the small model through twenty ineffective replacements. Control suffixes
+        // are presentation details; equal remaining names identify the same conceptual input. Distinct fields such as
+        // startDatePicker and endDatePicker remain distinct.
+        var inputConcepts = inputs
+            .Select(name => new
+            {
+                Name = name,
+                Concept = Regex.Replace(name, "(?:TextBox|MaskedTextBox|DateTimePicker|Picker|NumericUpDown|ComboBox|Input|Field|Control|Box)$", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            })
+            .Where(item => item.Concept.Length > 0)
+            .GroupBy(item => item.Concept, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1);
+        foreach (var duplicate in inputConcepts)
+            findings.Add($"exe.duplicate-input-concept:{duplicate.Key}: {string.Join(", ", duplicate.Select(item => item.Name))} appear to be duplicate editable controls for one field; keep one appropriate control, or rename and label them as distinct concepts when both are truly required");
+
+        // Counting Label objects was too weak: run 19 added two labels at the default (0,0), on top of each other and the
+        // folder button, solely to satisfy the count. Labels added directly to the form need an explicit layout position.
+        foreach (Match made in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?Label\s*[({]", RegexOptions.CultureInvariant))
+        {
+            var name = made.Groups["name"].Value;
+            var direct = Regex.IsMatch(code, @"(?:\bthis\s*\.)?Controls\.Add\s*\(\s*" + Regex.Escape(name) + @"\s*\)", RegexOptions.CultureInvariant);
+            var positioned = Regex.IsMatch(code, @"\b" + Regex.Escape(name) + @"\.(?:Location|Dock|Anchor)\s*=", RegexOptions.CultureInvariant) ||
+                             Regex.IsMatch(code, @"\.Controls\.Add\s*\(\s*" + Regex.Escape(name) + @"\s*,\s*\d+\s*,\s*\d+\s*\)", RegexOptions.CultureInvariant);
+            if (direct && !positioned)
+                findings.Add($"exe.label-default-position:{name}: the label \"{name}\" is added directly to the form but has no Location/Dock/layout cell, so it stays at (0,0) and can overlap another control; place it before or above its input with an explicit Location or a TableLayoutPanel cell");
+        }
+
+        // A control existing on screen is not evidence that its value affects the result. Detect the common generated
+        // shape where only a default is assigned (nudStartNumber.Value = 1) and the operation uses i + 1 instead.
+        foreach (Match made in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?(?<type>TextBox|MaskedTextBox|NumericUpDown|DateTimePicker|CheckBox|ComboBox)\s*[({]", RegexOptions.CultureInvariant))
+        {
+            var name = made.Groups["name"].Value;
+            var members = made.Groups["type"].Value switch
+            {
+                "TextBox" or "MaskedTextBox" => new[] { "Text" },
+                "NumericUpDown" or "DateTimePicker" => new[] { "Value" },
+                "CheckBox" => new[] { "Checked" },
+                _ => new[] { "SelectedItem", "SelectedValue", "SelectedIndex", "Text" }
+            };
+            var read = members.Any(member => Regex.Matches(code, @"\b" + Regex.Escape(name) + @"\." + member + @"\b", RegexOptions.CultureInvariant)
+                .Any(use => !Regex.IsMatch(code[use.Index..Math.Min(code.Length, use.Index + use.Length + 8)], @"^.*?\s*=(?!=)", RegexOptions.CultureInvariant)));
+            if (!read)
+                findings.Add($"exe.input-value-unused:{name}: the user can change {name}, but the program never reads its value, so that setting cannot affect the result; read {name}.{members[0]} when building the preview and use the same frozen plan when applying it");
+        }
+
+        // View.Details displays subitems through columns. Without columns the old → new preview that passed run 19 is
+        // blank or incomplete even though ListViewItem objects exist.
+        foreach (Match made in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?ListView\s*[({]", RegexOptions.CultureInvariant))
+        {
+            var name = made.Groups["name"].Value;
+            if (Regex.IsMatch(code, @"\b" + Regex.Escape(name) + @"\.View\s*=\s*View\.Details\b", RegexOptions.CultureInvariant) &&
+                !Regex.IsMatch(code, @"\b" + Regex.Escape(name) + @"\.Columns\.Add(?:Range)?\s*\(", RegexOptions.CultureInvariant))
+                findings.Add($"exe.details-without-columns:{name}: {name} uses View.Details but defines no columns, so an old → new preview cannot be read; add visible columns for the current name and planned name before adding rows");
+        }
+
+        // Captions that do not fit their button (MS UI Gothic 9 pt: about 12 pixels per Japanese letter, 7 per ASCII).
+        foreach (Match made in Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?:System\.Windows\.Forms\.)?Button\s*[({]", RegexOptions.CultureInvariant))
+        {
+            var name = made.Groups["name"].Value;
+            var statement = StatementAt(made.Index);
+            var text = Regex.Match(statement, @"\bText\s*=\s*""(?<t>[^""]*)""", RegexOptions.CultureInvariant) is { Success: true } inline ? inline.Groups["t"].Value
+                : Assigned(name, "Text") is { } assigned && Regex.Match(assigned, @"^""(?<t>[^""]*)""$") is { Success: true } literal ? literal.Groups["t"].Value : null;
+            if (text is null) continue;
+            var autoSize = Regex.IsMatch(statement, @"AutoSize\s*=\s*true", RegexOptions.CultureInvariant) || Assigned(name, "AutoSize")?.Trim() == "true";
+            var docked = Regex.IsMatch(statement, @"\bDock\s*=", RegexOptions.CultureInvariant) || Assigned(name, "Dock") is not null;
+            if (autoSize || docked) continue;
+            var width = Regex.Match(statement + ";" + (Assigned(name, "Size") ?? "") + ";" + (Assigned(name, "Width") is { } w ? "Width = " + w : ""),
+                @"(?:Size\s*=\s*)?new\s+Size\(\s*(?<w>\d+)|Width\s*=\s*(?<w>\d+)|^\s*new\s+Size\(\s*(?<w>\d+)", RegexOptions.CultureInvariant) is { Success: true } size
+                ? int.Parse(size.Groups["w"].Value, System.Globalization.CultureInfo.InvariantCulture) : 75;
+            var fontSize = Regex.Match(statement + ";" + (Assigned(name, "Font") ?? ""), @"new\s+Font\([^,]+,\s*(?<s>\d+(?:\.\d+)?)", RegexOptions.CultureInvariant) is { Success: true } font
+                ? double.Parse(font.Groups["s"].Value, System.Globalization.CultureInfo.InvariantCulture) : 9.0;
+            var needed = (int)Math.Ceiling(text.Sum(character => character < 0x2000 ? 7.0 : 12.0) * fontSize / 9.0) + 14;
+            if (needed > width)
+                findings.Add($"exe.button-text-cut:{name}: the caption 「{text}」 needs about {needed} pixels but the button is {width} wide, so the letters are squeezed; set {name}.AutoSize = true (and leave room beside it) or make it wider");
+        }
+
+        // English shown to a Japanese user.
+        var english = Regex.Matches(code, @"(?:\bText\s*=\s*|MessageBox\.Show\(\s*|\.Add\(\s*(?:string\.Format\(\s*)?)""(?<s>[^""\\]*(?:\\.[^""\\]*)*)""", RegexOptions.CultureInvariant)
+            .Select(match => match.Groups["s"].Value)
+            .Where(text => !Regex.IsMatch(text, @"[぀-ヿ一-鿿]") && Regex.Matches(text, @"[A-Za-z]{2,}").Count >= 2)
+            .Distinct().Take(3).ToArray();
+        if (english.Length > 0)
+            findings.Add($"exe.english-ui: the app shows English ({string.Join(" / ", english.Select(text => "「" + text + "」"))}); write every caption and message in Japanese");
+
+        // Random names where the user expects names they can read.
+        if (Regex.IsMatch(code, @"File\.(Move|Copy)|\.MoveTo\s*\(", RegexOptions.CultureInvariant) &&
+            Regex.IsMatch(code, @"Path\.GetRandomFileName|Guid\.NewGuid\s*\(|Path\.GetTempFileName", RegexOptions.CultureInvariant))
+            findings.Add("exe.random-names: files get random names (Path.GetRandomFileName / Guid), which nobody can read; build each new name from the rule the user sets (a prefix, today's date, a running number such as 001) and the original name");
+
+        foreach (var method in Methods(code))
+            // Moving files listed earlier, then leaving the list as it was: the next press looks for files that are gone.
+            if (Regex.IsMatch(method.Body, @"File\.Move|\.MoveTo\s*\(", RegexOptions.CultureInvariant) && Regex.IsMatch(method.Body, @"\bfor(each)?\s*\(", RegexOptions.CultureInvariant) &&
+                !Regex.IsMatch(method.Body, @"\.Clear\s*\(\s*\)|\.Enabled\s*=\s*false|=\s*new\s+List<|Directory\.(Get|Enumerate)Files", RegexOptions.CultureInvariant))
+                findings.Add($"exe.repeat-apply:{method.Name}: after the files are moved or renamed, the list still holds the old names, so pressing the button again fails; afterwards clear the list (or list the folder again) and disable the button until a new preview is made");
+
+        // The regenerated renamer (2026-10-26) gave every file "prefix_yyyyMMdd_HHmmss.ext", so the second File.Move
+        // found that name taken, and its preview read newNames[i] before the rename had filled newNames.
+        foreach (var (method, header, body) in Loops(code))
+        {
+            var moves = Regex.Matches(body, @"\bFile\.(?:Move|Copy)\s*\(", RegexOptions.CultureInvariant);
+            if (moves.Count == 0) continue;
+            var varying = new HashSet<string>(StringComparer.Ordinal);
+            foreach (Match declared in Regex.Matches(header, @"(?:\bint|\bvar|\bstring|\bFileInfo|\bKeyValuePair<[^>]+>)\s+(?<v>[A-Za-z_]\w*)\s*(?:=|\bin\b)|^\s*[\w.<>,\s]+?\s+(?<v>[A-Za-z_]\w*)\s+in\b", RegexOptions.CultureInvariant)) varying.Add(declared.Groups["v"].Value);
+            foreach (Match counted in Regex.Matches(method, @"\b(?<v>[A-Za-z_]\w*)\s*(?:\+\+|--|\+=|-=)|(?:\+\+|--)\s*(?<v>[A-Za-z_]\w*)", RegexOptions.CultureInvariant)) varying.Add(counted.Groups["v"].Value);
+            var locals = Regex.Matches(body, @"\b(?:var|string|int|FileInfo)\s+(?<v>[A-Za-z_]\w*)\s*=\s*(?<e>[^;]+);", RegexOptions.CultureInvariant).ToArray();
+            for (var changed = true; changed;)
+            {
+                changed = false;
+                foreach (var local in locals)
+                    if (!varying.Contains(local.Groups["v"].Value) && Identifiers(SameForEveryFile(local.Groups["e"].Value)).Any(varying.Contains))
+                        changed = varying.Add(local.Groups["v"].Value) || changed;
+            }
+            foreach (Match move in moves)
+            {
+                var arguments = Arguments(body, move.Index + move.Length);
+                if (arguments.Count == 2 && !Identifiers(SameForEveryFile(arguments[1])).Any(varying.Contains))
+                {
+                    findings.Add($"exe.same-new-name: every file in the loop gets the same new name ({arguments[1].Trim()}: the extension and the current time are the same for every file), so the second File.Move fails because that name is taken; put the running number (i + 1, formatted like (i + 1).ToString(\"000\")) or the original name (Path.GetFileNameWithoutExtension) into each new name");
+                    break;
+                }
+            }
+        }
+        foreach (var method in Methods(code))
+            foreach (Match loop in Regex.Matches(method.Body, @"\bfor\s*\(\s*(?:int|var)\s+(?<i>\w+)\s*=\s*0\s*;\s*\k<i>\s*<\s*(?<list>\w+)\.(?:Count|Length)\s*;", RegexOptions.CultureInvariant))
+                foreach (Match read in Regex.Matches(method.Body[loop.Index..], @"\b(?<other>[A-Za-z_]\w*)\s*\[\s*" + loop.Groups["i"].Value + @"\s*\]", RegexOptions.CultureInvariant))
+                {
+                    var other = read.Groups["other"].Value;
+                    if (other == loop.Groups["list"].Value || !Regex.IsMatch(code, @"\b" + other + @"\s*=\s*new\s+List<", RegexOptions.CultureInvariant) ||
+                        Regex.IsMatch(method.Body, @"\b" + other + @"\.(?:Add|AddRange|Insert|Count)\b", RegexOptions.CultureInvariant)) continue;
+                    // Two lists filled side by side (old and new names in one preview) stay the same length.
+                    var fillers = Methods(code).Where(candidate => Regex.IsMatch(candidate.Body, @"\b" + loop.Groups["list"].Value + @"\.Add(?:Range)?\s*\(", RegexOptions.CultureInvariant)).ToList();
+                    if (fillers.Count > 0 && fillers.All(candidate => Regex.IsMatch(candidate.Body, @"\b" + other + @"\.Add(?:Range)?\s*\(", RegexOptions.CultureInvariant))) continue;
+                    var filler = Methods(code).FirstOrDefault(candidate => candidate.Name != method.Name && Regex.IsMatch(candidate.Body, @"\b" + other + @"\.Add(?:Range)?\s*\(", RegexOptions.CultureInvariant));
+                    findings.Add($"exe.read-before-filled:{method.Name}: {other}[{loop.Groups["i"].Value}] is read for every item of {loop.Groups["list"].Value}, but {other} is filled only {(filler.Name is null ? "elsewhere" : "in " + filler.Name)}, so before that it is empty and the app stops with \"index out of range\"; fill {other} here (work out the planned names in the preview) and let the other handler use them");
+                    break;
+                }
+        return findings.Distinct().ToList();
+
+        static string SameForEveryFile(string expression) =>
+            Regex.Replace(expression, @"Path\.GetExtension\s*\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\)|DateTime\.(?:Now|Today|UtcNow)(?:\.\w+(?:\((?>[^()]+|\((?<d>)|\)(?<-d>))*(?(d)(?!))\))?)*", "", RegexOptions.CultureInvariant);
+        static IEnumerable<string> Identifiers(string expression) =>
+            Regex.Matches(Regex.Replace(expression, @"""(?:[^""\\]|\\.)*""", ""), @"\b[A-Za-z_]\w*\b", RegexOptions.CultureInvariant).Select(match => match.Value);
+    }
+
+    /// <summary>The arguments of the call whose opening parenthesis ends just before <paramref name="start"/>, split at top-level commas.</summary>
+    /// <summary>
+    /// Removes only a redundant editable control whose value is never read when exactly one peer for the same
+    /// concept is read. This is intentionally narrower than a source rewriter: every reference to the unused
+    /// control must be on a whole, mechanically removable construction/property/layout line. Ambiguous cases and
+    /// cases where both controls are read are returned unchanged.
+    /// </summary>
+    internal static string RemoveUnusedDuplicateInputControls(string code)
+    {
+        const string controlType = @"(?:System\.Windows\.Forms\.)?(?:TextBox|ComboBox|NumericUpDown|DateTimePicker|MaskedTextBox)";
+        var controls = Regex.Matches(code, @"\b(?<name>[A-Za-z_]\w*)\s*=\s*new\s+(?<type>" + controlType + @")\s*[({]", RegexOptions.CultureInvariant)
+            .Select(match => new
+            {
+                Name = match.Groups["name"].Value,
+                Type = match.Groups["type"].Value.Split('.').Last(),
+                Concept = Regex.Replace(match.Groups["name"].Value, "(?:TextBox|MaskedTextBox|DateTimePicker|Picker|NumericUpDown|ComboBox|Input|Field|Control|Box)$", "", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant)
+            })
+            .Where(item => item.Concept.Length > 0)
+            .GroupBy(item => item.Name, StringComparer.Ordinal)
+            .Select(group => group.First())
+            .ToArray();
+
+        static string[] ValueMembers(string type) => type switch
+        {
+            "TextBox" or "MaskedTextBox" => ["Text"],
+            "NumericUpDown" or "DateTimePicker" => ["Value"],
+            _ => ["SelectedItem", "SelectedValue", "SelectedIndex", "Text"]
+        };
+        bool IsRead(string name, string type) => ValueMembers(type).Any(member =>
+            Regex.Matches(code, @"\b" + Regex.Escape(name) + @"\." + member + @"\b", RegexOptions.CultureInvariant)
+                .Any(use => !Regex.IsMatch(code[use.Index..Math.Min(code.Length, use.Index + use.Length + 8)], @"^.*?\s*=(?!=)", RegexOptions.CultureInvariant)));
+
+        var removable = controls
+            .GroupBy(item => item.Concept, StringComparer.OrdinalIgnoreCase)
+            .Where(group => group.Count() > 1 && group.Count(item => IsRead(item.Name, item.Type)) == 1)
+            .SelectMany(group => group.Where(item => !IsRead(item.Name, item.Type)))
+            .ToArray();
+        if (removable.Length == 0) return code;
+
+        var newline = code.Contains("\r\n", StringComparison.Ordinal) ? "\r\n" : "\n";
+        var lines = code.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n').ToList();
+        foreach (var item in removable)
+        {
+            var identifier = @"\b" + Regex.Escape(item.Name) + @"\b";
+            var containing = lines.Select((line, index) => (line, index)).Where(entry => Regex.IsMatch(entry.line, identifier, RegexOptions.CultureInvariant)).ToArray();
+            bool Safe(string line) =>
+                Regex.IsMatch(line, @"^\s*(?:(?:private|public|protected|internal|static|readonly)\s+)*" + controlType + @"\s+" + Regex.Escape(item.Name) + @"\s*;\s*$", RegexOptions.CultureInvariant) ||
+                Regex.IsMatch(line, @"^\s*(?:var\s+)?" + Regex.Escape(item.Name) + @"\s*=\s*new\s+" + controlType + @"\s*[({].*;\s*$", RegexOptions.CultureInvariant) ||
+                Regex.IsMatch(line, @"^\s*" + Regex.Escape(item.Name) + @"\.\w+\s*(?:\+?=)\s*.*;\s*$", RegexOptions.CultureInvariant) ||
+                Regex.IsMatch(line, @"^\s*(?:(?:this\.)?[A-Za-z_]\w*\.)?Controls\.Add\s*\(\s*" + Regex.Escape(item.Name) + @"\s*(?:,\s*\d+\s*,\s*\d+\s*)?\)\s*;\s*$", RegexOptions.CultureInvariant);
+            if (containing.Length == 0 || containing.Any(entry => !Safe(entry.line))) continue;
+
+            var containerNames = containing
+                .Select(entry => Regex.Match(entry.line, @"^\s*(?<container>[A-Za-z_]\w*)\.Controls\.Add\s*\(\s*" + Regex.Escape(item.Name), RegexOptions.CultureInvariant))
+                .Where(match => match.Success)
+                .Select(match => match.Groups["container"].Value)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            foreach (var index in containing.Select(entry => entry.index).OrderByDescending(index => index)) lines.RemoveAt(index);
+
+            // If the removed control was the only child of a dedicated layout container, remove that now-empty
+            // container too, but only when all remaining references are the same simple construction/layout lines.
+            foreach (var container in containerNames)
+            {
+                if (lines.Any(line => Regex.IsMatch(line, @"\b" + Regex.Escape(container) + @"\.Controls\.Add\s*\(", RegexOptions.CultureInvariant))) continue;
+                var identifier2 = @"\b" + Regex.Escape(container) + @"\b";
+                var uses = lines.Select((line, index) => (line, index)).Where(entry => Regex.IsMatch(entry.line, identifier2, RegexOptions.CultureInvariant)).ToArray();
+                bool SafeContainer(string line) =>
+                    Regex.IsMatch(line, @"^\s*(?:(?:private|public|protected|internal|static|readonly)\s+)*(?:System\.Windows\.Forms\.)?(?:FlowLayoutPanel|TableLayoutPanel|Panel)\s+" + Regex.Escape(container) + @"\s*;\s*$", RegexOptions.CultureInvariant) ||
+                    Regex.IsMatch(line, @"^\s*(?:var\s+)?" + Regex.Escape(container) + @"\s*=\s*new\s+(?:System\.Windows\.Forms\.)?(?:FlowLayoutPanel|TableLayoutPanel|Panel)\s*[({].*;\s*$", RegexOptions.CultureInvariant) ||
+                    Regex.IsMatch(line, @"^\s*" + Regex.Escape(container) + @"\.\w+\s*(?:\+?=)\s*.*;\s*$", RegexOptions.CultureInvariant) ||
+                    Regex.IsMatch(line, @"^\s*(?:(?:this\.)?[A-Za-z_]\w*\.)?Controls\.Add\s*\(\s*" + Regex.Escape(container) + @"\s*(?:,\s*\d+\s*,\s*\d+\s*)?\)\s*;\s*$", RegexOptions.CultureInvariant);
+                if (uses.Length > 0 && uses.All(entry => SafeContainer(entry.line)))
+                    foreach (var index in uses.Select(entry => entry.index).OrderByDescending(index => index)) lines.RemoveAt(index);
+            }
+        }
+        return string.Join(newline, lines);
+    }
+
+    private static List<string> Arguments(string code, int start)
+    {
+        var arguments = new List<string>();
+        var depth = 0;
+        var from = start;
+        for (var at = start; at < code.Length; at++)
+        {
+            var character = code[at];
+            if (character == '"') { at++; while (at < code.Length && code[at] != '"') at += code[at] == '\\' ? 2 : 1; continue; }
+            if (character is '(' or '[' or '{') depth++;
+            else if (character is ')' or ']' or '}' && depth-- == 0) { arguments.Add(code[from..at]); return arguments; }
+            else if (character == ',' && depth == 0) { arguments.Add(code[from..at]); from = at + 1; }
+        }
+        return arguments;
+    }
+
+    /// <summary>Each for/foreach loop with its method's body, its header (inside the parentheses) and its body.</summary>
+    private static IEnumerable<(string Method, string Header, string Body)> Loops(string code)
+    {
+        foreach (var method in Methods(code))
+            foreach (Match loop in Regex.Matches(method.Body, @"\b(?:for|foreach)\s*\(", RegexOptions.CultureInvariant))
+            {
+                var header = string.Join(",", Arguments(method.Body, loop.Index + loop.Length));
+                var after = loop.Index + loop.Length + header.Length + 1;
+                var open = method.Body.IndexOf('{', after);
+                var statementEnd = method.Body.IndexOf(';', after);
+                if (open < 0 || (statementEnd >= 0 && statementEnd < open)) { yield return (method.Body, header, statementEnd < 0 ? method.Body[after..] : method.Body[after..statementEnd]); continue; }
+                var depth = 1;
+                var end = open + 1;
+                for (; end < method.Body.Length && depth > 0; end++) depth += method.Body[end] == '{' ? 1 : method.Body[end] == '}' ? -1 : 0;
+                yield return (method.Body, header, method.Body[(open + 1)..Math.Max(open + 1, end - 1)]);
+            }
+    }
+
+    private static IEnumerable<(string Name, string Body)> Methods(string code)
+    {
+        foreach (Match header in Regex.Matches(code, @"\bvoid\s+(?<name>\w+)\s*\([^)]*\)\s*\{", RegexOptions.CultureInvariant))
+        {
+            var start = header.Index + header.Length;
+            var depth = 1;
+            var end = start;
+            for (; end < code.Length && depth > 0; end++) depth += code[end] == '{' ? 1 : code[end] == '}' ? -1 : 0;
+            yield return (header.Groups["name"].Value, code[start..Math.Max(start, end - 1)]);
+        }
+    }
+
+    internal static IReadOnlyList<string> RequirementsWithoutMechanism(IEnumerable<string> features, string source) =>
+        features.SelectMany(feature => Mechanisms
+                .Where(mechanism => mechanism.Asks.IsMatch(feature) && !mechanism.Uses.IsMatch(source))
+                .Select(mechanism => $"requirement.mechanism-missing:{mechanism.Name} (「{(feature.Length > 60 ? feature[..60] + "…" : feature)}」 needs this, but the code never does it: {mechanism.Hint})"))
+            .Distinct()
+            .ToArray();
+
+    /// <summary>
+    /// The app reacts to something: an event handler is attached (clicks, mouse, keys, value changes, a timer) or the form
+    /// paints itself. A memory game whose cards used MouseClick was refused when only ".Click" counted (2026-10-20).
+    /// </summary>
+    internal static bool IsInteractive(string source) =>
+        Regex.IsMatch(source, @"\.\s*\w*(Click|Mouse\w*|Key\w*|Changed|Tick|Paint|Scroll|Drag\w*|Drop|CheckedChanged|Elapsed)\s*\+=", RegexOptions.CultureInvariant) ||
+        source.Contains("OnPaint", StringComparison.Ordinal) || Regex.IsMatch(source, @"override\s+void\s+On(Mouse|Key)\w*\s*\(", RegexOptions.CultureInvariant);
+
+    private static readonly string[] ForbiddenApi =
+    [
+        @"\bSystem\.Net\b", @"\b(HttpClient|WebClient|WebRequest|HttpWebRequest|TcpClient|UdpClient|Socket)\b",
+        @"\bProcess\s*\.\s*(Start|GetProcess\w*|Kill)\b", @"\bnew\s+Process\s*\(", @"\bProcessStartInfo\b", @"\bSystem\.Diagnostics\b",
+        @"\bRegistry(Key)?\b", @"\bMicrosoft\.Win32\b", @"\bDllImport\b", @"\b(static\s+extern|extern\s+static)\b",
+        @"\bSystem\.Reflection\b", @"\bAssembly\s*\.\s*Load\w*", @"\bunsafe\b", @"\bdynamic\b", @"\bWebBrowser\b",
+        @"(?i)\brunas\b", @"(?i)\bcmd\.exe\b", @"(?i)\bpowershell\b", @"(?i)\bhttps?://", @"\.\.\\"
+    ];
 
     internal static string AddSafeFrameworkUsings(string source)
     {
         source = RelocateStaThreadAttribute(source);
+        // Only the .NET Framework that comes with Windows is there: "using DocumentFormat.OpenXml…" (an invoice, 2026-10-20)
+        // and other outside libraries cannot be found. Their usings go; Excel work uses the XlsxLite helper instead.
+        source = Regex.Replace(source, @"(?m)^[ \t]*using\s+(?!System\b)(?!static\b)[A-Za-z_][\w.]*\s*;[ \t]*\r?\n?", "", RegexOptions.CultureInvariant);
+        // "using XlsxLite;": the helpers are classes, not namespaces (CS0138, Excel merge 2026-10-19); they need no using.
+        foreach (var tool in WindowsToolbox.All)
+            source = Regex.Replace(source, @"(?m)^[ \t]*using\s+(static\s+)?" + Regex.Escape(Path.GetFileNameWithoutExtension(tool.FileName)) + @"\s*;[ \t]*\r?\n?", "", RegexOptions.CultureInvariant);
         var additions = new List<string>();
         AddWhenNeeded("List<", "using System.Collections.Generic;");
         AddWhenNeeded("Dictionary<", "using System.Collections.Generic;");
@@ -644,6 +1167,9 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         AddWhenNeeded("StringBuilder", "using System.Text;");
         AddWhenNeeded("File.", "using System.IO;");
         AddWhenNeeded("Directory.", "using System.IO;");
+        // Printing (an invoice EXE failed all attempts on PrintDocument without this using, catalogue 2026-10-19).
+        foreach (var printing in new[] { "PrintDocument", "PrintPageEventArgs", "PrintPageEventHandler" })
+            AddWhenNeeded(printing, "using System.Drawing.Printing;");
         // In-memory queries (array.Contains, list.Where, OrderBy): System.Linq, referenced from System.Core.
         foreach (var linq in new[] { ".Contains(", ".Where(", ".Select(", ".OrderBy(", ".ToList()", ".ToArray()", ".Any(", ".Count(", ".First(", ".Sum(", ".Max(", ".Min(", ".Distinct(" })
             AddWhenNeeded(linq, "using System.Linq;");
@@ -658,22 +1184,38 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         }
     }
 
-    internal static string UnwrapWholeSourceFence(string source)
+    internal static string UnwrapWholeSourceFence(string? source)
     {
-        var trimmed = source.Trim().TrimStart('\uFEFF');
+        // A JSON reply without program_cs deserialises to null (Smoke crashed on it once, 2026-10-19): treat it as empty,
+        // which the source check rejects as missing and the next attempt repairs.
+        var trimmed = (source ?? "").Trim().TrimStart('\uFEFF');
         var match = Regex.Match(
             trimmed,
             @"\A```(?:csharp|cs)?[ \t]*\r?\n(?<source>[\s\S]*?)\r?\n```[ \t]*\z",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
             TimeSpan.FromSeconds(1));
-        return match.Success ? match.Groups["source"].Value : trimmed;
+        if (match.Success) return match.Groups["source"].Value;
+        // Explanations around one or more fenced blocks (a memory game was refused as invalid format repeatedly,
+        // catalogue 2026-10-19): the largest block that holds a class is the program.
+        var blocks = Regex.Matches(trimmed, @"```(?:csharp|cs|c#)?[ \t]*\r?\n(?<source>[\s\S]*?)\r?\n```", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant, TimeSpan.FromSeconds(1))
+            .Select(block => block.Groups["source"].Value)
+            .Where(block => Regex.IsMatch(block, @"\bclass\s+\w+", RegexOptions.CultureInvariant))
+            .OrderByDescending(block => block.Length)
+            .FirstOrDefault();
+        return blocks ?? trimmed;
     }
 
     internal static IReadOnlyList<string> ValidateRequirementGrounding(
         string source,
         StudioBlueprint blueprint,
-        StudioProjectKind kind)
+        StudioProjectKind kind,
+        string? sourceRequest = null)
     {
+        // The user's own words count too: an invoice's 印刷 was dropped from the planned features and the EXE shipped
+        // without printing (catalogue 2026-10-20).
+        if (kind == StudioProjectKind.WindowsApp)
+            return RequirementsWithoutMechanism(string.IsNullOrWhiteSpace(sourceRequest) ? blueprint.Features : blueprint.Features.Append(sourceRequest), source)
+                .Concat(FalseSuccessShapes(source)).Distinct().ToArray();
         if (kind != StudioProjectKind.WindowsGame) return [];
         var request = string.Join(" ", new[] { blueprint.Name, blueprint.Summary }.Concat(blueprint.Features));
         if (!request.Contains("テトリス", StringComparison.OrdinalIgnoreCase) &&
@@ -774,6 +1316,7 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
         StudioBlueprint blueprint,
         StudioProjectKind kind,
         IReadOnlyList<GeneratedRequirement> requirements,
+        IReadOnlyList<WindowsToolbox.Tool> tools,
         CancellationToken cancellationToken)
     {
         _paths.EnsureCreated();
@@ -785,6 +1328,8 @@ public sealed class LocalWindowsAppGenerationEngine : IGenerativeProjectGenerato
             await File.WriteAllTextAsync(Path.Combine(root, "Program.cs"), Normalize(source), new UTF8Encoding(false, true), cancellationToken);
             await File.WriteAllTextAsync(Path.Combine(root, "app.manifest"), WindowsApplicationManifest.Content, new UTF8Encoding(false, true), cancellationToken);
             await File.WriteAllTextAsync(Path.Combine(root, "requirements.json"), BuildRequirements(blueprint, kind, requirements), new UTF8Encoding(false, true), cancellationToken);
+            foreach (var helper in WindowsToolbox.Files(tools))
+                await File.WriteAllTextAsync(Path.Combine(root, helper.RelativePath), helper.Content, new UTF8Encoding(false, true), cancellationToken);
             var verification = await _verifier.VerifyAsync(root, cancellationToken);
             if (!verification.Passed) return verification.Errors.ToArray();
             try

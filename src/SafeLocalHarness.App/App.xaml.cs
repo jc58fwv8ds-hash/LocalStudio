@@ -82,17 +82,20 @@ public partial class App : Application
         GuideDrafter = new LibraryGuideDrafter(_ollama, settings, resources: resources);
         // The App Spec route first (trials 2026-10-13: stopwatch, shopping list and bill splitter built correctly from one
         // small-model answer, where free generation failed or passed broken apps); free generation remains the fallback.
-        _implementationGenerator = new LocalWebAppGenerationEngine(_ollama, settings, resources: resources) { Libraries = LibraryShelf, PreferAppSpec = true };
+        _implementationGenerator = new LocalWebAppGenerationEngine(_ollama, settings, resources: resources) { Libraries = LibraryShelf, PreferAppSpec = true, WriteAcceptance = true };
         // Each built EXE is started minimised and used before it is accepted (trial 2026-10-14).
         _windowsImplementationGenerator = new LocalWindowsAppGenerationEngine(_ollama, settings, paths, resources: resources) { BehaviorCheck = WindowsAppBehaviorChecker.CheckAsync };
         _appsScriptGenerator = new LocalAppsScriptGenerationEngine(_ollama, settings, resources: resources);
         // 3-4: everything happens in the chat. The output kind is decided in the conversation, and Web and GAS projects
         // are improved as new versions of the same project.
+        // Large apps in parts: a core first, then the agent loop adds one feature at a time;
+        // a generator's last failing candidate is repaired in place by the same loop.
+        var growth = new FeatureGrowth(paths, _ollama, () => settings.Load().SelectedModel, resources, WindowsAppBehaviorChecker.CheckAsync);
         var scaffolder = new ProjectScaffolder(
             paths,
             generativeGenerator: _implementationGenerator,
             windowsGenerativeGenerator: _windowsImplementationGenerator,
-            appsScriptGenerator: _appsScriptGenerator);
+            appsScriptGenerator: _appsScriptGenerator) { Repair = growth.RepairAsync };
         var improver = new KindRoutingImprover(new WebProjectImprover(_implementationGenerator!), new GasProjectImprover(_appsScriptGenerator!));
         var planner = _planner!;
         // 3-5: screenshots are read by the vision model first, then the code model works from the description.
@@ -113,7 +116,7 @@ public partial class App : Application
         var pdf = new PdfAssistant(new RecordingPdfPlanner(_pdfPlanner, exchangeLog), new SafeLocalHarness.Windows.WindowsPdfImaging());
         var hybridPlanner = new HybridPlanningEngine(planner);
         _chat = new ChatViewModel(
-            () => new ConversationOrchestrator(hybridPlanner, planner, scaffolder, ConversationLog.CreateSession(paths), () => settings.Load().SelectedModel, improver, describer) { Rename = rename, Office = office, Pdf = pdf },
+            () => new ConversationOrchestrator(hybridPlanner, planner, scaffolder, ConversationLog.CreateSession(paths), () => settings.Load().SelectedModel, improver, describer) { Rename = rename, Office = office, Pdf = pdf, Growth = growth },
             async projectRoot =>
             {
                 var opened = await ConversationOrchestrator.OpenProjectAsync(hybridPlanner, planner, scaffolder, improver, projectRoot, () => settings.Load().SelectedModel, imageDescriber: describer);
@@ -124,7 +127,11 @@ public partial class App : Application
             },
             draftStore)
         {
-            OpenSession = logPath => new ConversationOrchestrator(hybridPlanner, planner, scaffolder, ConversationLog.Open(logPath), () => settings.Load().SelectedModel, improver, describer) { Rename = rename, Office = office, Pdf = pdf }
+            OpenSession = logPath => new ConversationOrchestrator(hybridPlanner, planner, scaffolder, ConversationLog.Open(logPath), () => settings.Load().SelectedModel, improver, describer) { Rename = rename, Office = office, Pdf = pdf, Growth = growth },
+            // The memory mode can be changed from the chat at any time, through the same session-only state as Setup.
+            CurrentMode = () => modeState.Current,
+            ChangeMode = mode => modeState.SetAsync(mode),
+            Confirm = message => MessageBox.Show(message, "LocalStudio", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes
         };
         // Nothing is downloaded at startup. The Setup screen shows the pinned plan and runs it only on an explicit click.
         _runtimeCatalog = new OfficialRuntimeCatalog();
@@ -148,6 +155,7 @@ public partial class App : Application
             localAiSetup,
             settings,
             message => MessageBox.Show(message, "LocalStudio", MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) == MessageBoxResult.Yes);
+        modeState.Changed += mode => Dispatcher.InvokeAsync(() => { _chat?.RefreshMode(); _setup?.ShowMode(mode); });
         const string cartridgeFilter = "LocalStudioカートリッジ (*.lscart)|*.lscart";
         var cartridgeDialogs = new CartridgeDialogs(
             suggestedName =>

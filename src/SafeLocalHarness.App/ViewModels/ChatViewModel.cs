@@ -65,6 +65,65 @@ public sealed class ChatViewModel : ViewModelBase
         ClearDocumentCommand = new RelayCommand(_ => SetDocument(null));
         RemoveAttachmentCommand = new RelayCommand(parameter => { if (parameter is PendingAttachment item) PendingAttachments.Remove(item); SendCommand.Refresh(); });
         _clock = new DispatcherTimer(TimeSpan.FromSeconds(1), DispatcherPriority.Background, (_, _) => Raise(nameof(ActivityLine)), _dispatcher);
+        SetModeCommand = new RelayCommand(parameter => { if (parameter is string name && Enum.TryParse<ResourceMode>(name, out var mode)) _ = ChangeModeAsync(mode, retry: false); }, _ => ChangeMode is not null);
+    }
+
+    /// <summary>The memory mode, changeable from the chat at any time (user, 2026-10-19). Expert asks for confirmation first.</summary>
+    public Func<ResourceMode>? CurrentMode { get; init; }
+    public Func<ResourceMode, Task>? ChangeMode { get; init; }
+    public Func<string, bool>? Confirm { get; init; }
+    public RelayCommand SetModeCommand { get; }
+    public const string ExpertRetryChoice = "ui:expert-retry";
+    public ResourceMode Mode => CurrentMode?.Invoke() ?? ResourceMode.Coexistence;
+    public bool IsExpert => Mode == ResourceMode.Expert;
+    public string ModeLabel => Mode switch
+    {
+        ResourceMode.Expert => "メモリ：エキスパート",
+        ResourceMode.Focus => "メモリ：集中",
+        _ => "メモリ：共存"
+    };
+    public string ModeToolTip => Mode switch
+    {
+        ResourceMode.Expert => "エキスパートモード（今回の起動中のみ）：空いているメモリをほぼすべてAIに使います。押すと切り替えられます。",
+        ResourceMode.Focus => "集中モード：AIに使えるメモリを広げます。押すと切り替えられます。",
+        _ => "共存モード（標準）：他のアプリのための予備を多めに残します。押すと切り替えられます。"
+    };
+
+    /// <summary>Called when the mode changed anywhere (also from the Setup screen).</summary>
+    public void RefreshMode()
+    {
+        Raise(nameof(Mode)); Raise(nameof(IsExpert)); Raise(nameof(ModeLabel)); Raise(nameof(ModeToolTip));
+    }
+
+    private Func<CancellationToken, Task>? _lastWork;
+
+    private async Task ChangeModeAsync(ResourceMode mode, bool retry)
+    {
+        if (ChangeMode is null || (mode == Mode && !retry)) return;
+        if (mode == ResourceMode.Expert && Mode != ResourceMode.Expert && Confirm is not null && !Confirm(SetupViewModel.ExpertModeWarning)) return;
+        try { await ChangeMode(mode); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
+        {
+            AddLocalNotice("モードを切り替えられませんでした: " + ex.Message);
+            return;
+        }
+        RefreshMode();
+        AddLocalNotice(mode switch
+        {
+            ResourceMode.Expert => "エキスパートモードにしました（今回の起動中のみ）。",
+            ResourceMode.Focus => "集中モードにしました。",
+            _ => "共存モードに戻しました。"
+        } + (retry && _lastWork is not null ? "止まった処理をもう一度始めます。" : ""));
+        if (retry && _lastWork is { } work && !IsBusy) await RunAsync(work);
+    }
+
+    /// <summary>A reply in which the memory guard stopped AI work gets a button to switch to Expert and try again.</summary>
+    private void OfferExpertIfStopped(string text)
+    {
+        if (ChangeMode is null || IsExpert || !MemoryGuardMessages.IsRefusal(text)) return;
+        Messages.Add(new ChatMessageItem(false, "メモリに余裕がないため止まりました。エキスパートモードにすると、空いているメモリをほぼすべて使って続けられます（他のアプリが遅くなる場合があります）。",
+            [], [new ChatChoiceItem(ExpertRetryChoice, "エキスパートモードでもう一度", true)]));
+        Raise(nameof(IsEmpty));
     }
 
     public event Action<string>? ProjectChanged;
@@ -281,6 +340,7 @@ public sealed class ChatViewModel : ViewModelBase
 
     private Task ChooseAsync(string choiceId)
     {
+        if (choiceId == ExpertRetryChoice) return ChangeModeAsync(ResourceMode.Expert, retry: true);
         // "開いて確かめる": the latest working copy opens in its usual app (several files: their folder).
         if (choiceId.StartsWith(ConversationOrchestrator.WorkOpenPrefix, StringComparison.Ordinal))
         {
@@ -297,6 +357,7 @@ public sealed class ChatViewModel : ViewModelBase
     {
         var running = IsRunning;
         if (!running) BeginActivity();
+        _lastWork = work;
         try
         {
             await work(_lifetime.Token);
@@ -309,6 +370,7 @@ public sealed class ChatViewModel : ViewModelBase
         catch (Exception ex) when (ex is InvalidOperationException or InvalidDataException or ArgumentException or IOException or UnauthorizedAccessException)
         {
             AddLocalNotice(ex.Message);
+            OfferExpertIfStopped(ex.Message);
         }
         finally
         {
@@ -324,6 +386,7 @@ public sealed class ChatViewModel : ViewModelBase
             if (!ReferenceEquals(conversation, _conversation)) return;
             Messages.Add(ToItem(message, conversation.Log.Folder));
             Raise(nameof(IsEmpty));
+            if (message.Role != ConversationRole.User) OfferExpertIfStopped(message.Text);
             if (conversation.ProjectPath is null && _openedProject is null && conversation.Messages.Count == 1)
             {
                 _openedSession = conversation.Log.FilePath;

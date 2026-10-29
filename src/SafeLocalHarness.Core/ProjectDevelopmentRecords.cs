@@ -105,7 +105,14 @@ public static class RequirementLedgerStore
 
 public sealed record ProjectSourceFingerprint(string RelativePath, long Size, string Sha256);
 public sealed record ProjectBuildState(string Status, DateTimeOffset RecordedAt, string? ArtifactFingerprint);
-public sealed record ProjectTestDefinition(string Id, string RequirementId, string Kind, string Description);
+public sealed record ProjectTestAssertion(string Operation, string RelativePath, string? Expected = null);
+public sealed record ProjectTestSpecification(int SchemaVersion, IReadOnlyList<ProjectTestAssertion> Assertions);
+public sealed record ProjectTestDefinition(
+    string Id,
+    string RequirementId,
+    string Kind,
+    string Description,
+    [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ProjectTestSpecification? Specification = null);
 public sealed record ProjectTestResult(string TestId, string Status, string EvidencePath, DateTimeOffset RecordedAt);
 
 public sealed record ProjectCartridge(
@@ -237,8 +244,29 @@ public static class ProjectCartridgeStore
         var dagValidation = DevelopmentUnitGraph.Validate(cartridge.TaskDag);
         issues.AddRange(dagValidation.Errors);
         var requirementIds = cartridge.RequirementLedger.Items.Select(item => item.Id).ToHashSet(StringComparer.Ordinal);
+        var testIds = new HashSet<string>(StringComparer.Ordinal);
         foreach (var definition in cartridge.TestDefinitions)
+        {
+            if (!PortableProjectPath.IsSafeIdentifier(definition.Id)) issues.Add("test.invalid-id:" + definition.Id);
+            else if (!testIds.Add(definition.Id)) issues.Add("test.duplicate-id:" + definition.Id);
             if (!requirementIds.Contains(definition.RequirementId)) issues.Add("test.unknown-requirement:" + definition.Id);
+            if (!PortableProjectPath.IsSafeIdentifier(definition.Kind) || definition.Kind.Length > 80) issues.Add("test.invalid-kind:" + definition.Id);
+            if (string.IsNullOrWhiteSpace(definition.Description) || definition.Description.Length > 500) issues.Add("test.invalid-description:" + definition.Id);
+            if (definition.Specification is { } specification)
+            {
+                if (specification.SchemaVersion != 1) issues.Add("test.specification-version:" + definition.Id);
+                if (specification.Assertions.Count is < 1 or > 64) issues.Add("test.assertion-count:" + definition.Id);
+                foreach (var assertion in specification.Assertions)
+                {
+                    if (!PortableProjectPath.IsSafeIdentifier(assertion.Operation) || assertion.Operation.Length > 80)
+                        issues.Add("test.invalid-operation:" + definition.Id);
+                    if (!PortableProjectPath.IsSafeRelative(assertion.RelativePath) ||
+                        assertion.RelativePath.Replace('\\', '/').StartsWith(".localstudio/", StringComparison.OrdinalIgnoreCase))
+                        issues.Add("test.invalid-assertion-path:" + definition.Id);
+                    if (assertion.Expected?.Length > 4096) issues.Add("test.expected-too-long:" + definition.Id);
+                }
+            }
+        }
         return issues.Distinct(StringComparer.Ordinal).ToArray();
     }
 }

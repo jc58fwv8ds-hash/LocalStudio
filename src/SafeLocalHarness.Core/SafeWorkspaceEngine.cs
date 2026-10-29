@@ -80,6 +80,50 @@ public sealed class SafeWorkspaceSession
     public bool IsVerified => _verified;
     public IReadOnlyCollection<string> ChangedFiles => _changed;
 
+    /// <summary>Project files with sizes (control area and build outputs left out), for an agent to find its way.</summary>
+    public string ListFiles()
+    {
+        EnsureOpen();
+        var lines = VisibleFiles().Select(full => $"{Path.GetRelativePath(_projectRoot, full).Replace('\\', '/')} ({new FileInfo(full).Length:N0} bytes)").Take(200).ToArray();
+        return lines.Length == 0 ? "(no files)" : string.Join("\n", lines);
+    }
+
+    /// <summary>Lines containing <paramref name="query"/> (case-insensitive) across the project's text files, with line numbers.</summary>
+    public string Search(string query, int maximumHits = 30)
+    {
+        EnsureOpen();
+        if (string.IsNullOrWhiteSpace(query)) throw new InvalidOperationException("検索語を指定してください。");
+        var hits = new List<string>();
+        foreach (var full in VisibleFiles())
+        {
+            if (new FileInfo(full).Length > MaximumFileBytes) continue;
+            string text;
+            try { text = DecodeStrictUtf8(File.ReadAllBytes(full)); }
+            catch (DecoderFallbackException) { continue; }
+            var lines = text.Replace("\r\n", "\n").Split('\n');
+            for (var index = 0; index < lines.Length && hits.Count < maximumHits; index++)
+                if (lines[index].Contains(query, StringComparison.OrdinalIgnoreCase))
+                    hits.Add($"{Path.GetRelativePath(_projectRoot, full).Replace('\\', '/')}:{index + 1}: {Limit(lines[index].Trim(), 200)}");
+            if (hits.Count >= maximumHits) break;
+        }
+        return hits.Count == 0 ? "No lines contain \"" + query + "\"." : string.Join("\n", hits);
+    }
+
+    /// <summary>Relative paths of the project's source files (what an agent may read and change).</summary>
+    public IReadOnlyList<string> SourceFiles(params string[] extensions) =>
+        VisibleFiles().Select(full => Path.GetRelativePath(_projectRoot, full).Replace('\\', '/'))
+            .Where(relative => extensions.Length == 0 || extensions.Contains(Path.GetExtension(relative), StringComparer.OrdinalIgnoreCase)).ToArray();
+
+    private IEnumerable<string> VisibleFiles() =>
+        Directory.EnumerateFiles(_projectRoot, "*", SearchOption.AllDirectories)
+            .Where(full =>
+            {
+                var relative = Path.GetRelativePath(_projectRoot, full);
+                return !relative.StartsWith(".localstudio", StringComparison.OrdinalIgnoreCase) && !ProjectFilePolicy.IsBuildOutput(relative) &&
+                       !relative.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !relative.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase);
+            })
+            .OrderBy(full => full, StringComparer.OrdinalIgnoreCase);
+
     internal async Task InitializeAsync(CancellationToken cancellationToken)
     {
         await RecordAsync("start", "", "ACTIVE", "run snapshot session started", cancellationToken);

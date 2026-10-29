@@ -27,11 +27,18 @@ public sealed class NpmLibrarySource(HttpClient http, string downloadRoot)
     public const long MaxUnpackedBytes = 60L * 1024 * 1024;
     public const int MaxEntries = 5_000;
 
+    /// <summary>An npm package name, scoped ("@pdf-lib/fontkit") or not ("chart.js").</summary>
+    public static bool IsValidPackageName(string name) =>
+        Regex.IsMatch(name, @"^(@[a-z0-9][a-z0-9._-]{0,39}/)?[a-z0-9][a-z0-9._-]{0,39}$", RegexOptions.CultureInvariant);
+
+    /// <summary>The shelf name of a package: "@pdf-lib/fontkit" becomes "pdf-lib-fontkit" (a folder name without "@" or "/").</summary>
+    public static string ShelfName(string packageName) => packageName.TrimStart('@').Replace('/', '-');
+
     public static string MetadataUrl(string name) => Registry + Uri.EscapeDataString(name).Replace("%40", "@", StringComparison.Ordinal);
 
     public async Task<NpmPackageInfo> ReadAsync(string name, string? version = null, CancellationToken cancellationToken = default)
     {
-        if (!LibraryShelf.IsValidName(name)) throw new InvalidDataException("パッケージ名は英小文字・数字・. - _ で指定してください（例: chart.js）。");
+        if (!IsValidPackageName(name)) throw new InvalidDataException("パッケージ名は英小文字・数字・. - _ で指定してください（例: chart.js、@pdf-lib/fontkit）。");
         using var response = await http.GetAsync(MetadataUrl(name), HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         if (response.StatusCode == System.Net.HttpStatusCode.NotFound) throw new InvalidOperationException($"npm に {name} というパッケージは見つかりません。");
         response.EnsureSuccessStatusCode();
@@ -77,7 +84,7 @@ public sealed class NpmLibrarySource(HttpClient http, string downloadRoot)
         var bytes = buffer.ToArray();
         var actual = "sha512-" + Convert.ToBase64String(SHA512.HashData(bytes));
         if (actual != info.Integrity) throw new InvalidDataException("取得したファイルの SHA-512 が npm の記録と違うため、使いません。");
-        var folder = Path.Combine(downloadRoot, $"{info.Name}@{info.Version}-{Guid.NewGuid().ToString("N")[..6]}");
+        var folder = Path.Combine(downloadRoot, $"{ShelfName(info.Name)}@{info.Version}-{Guid.NewGuid().ToString("N")[..6]}");
         Directory.CreateDirectory(folder);
         var candidates = new List<string>();
         string? readme = null, licenseText = null;

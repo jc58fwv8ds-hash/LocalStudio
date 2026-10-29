@@ -84,7 +84,8 @@ public sealed class DevelopmentProjectAssembler
             {
                 schemaVersion = 1,
                 verifier = "LocalStudio.DevelopmentUnitExecutionEngine",
-                result = "PASS",
+                // The DAG passing says every unit built and was checked, not that each requested feature works.
+                result = "DAG_PASS",
                 planFingerprint = state.PlanFingerprint,
                 verifiedAt = state.UpdatedAt,
                 releaseGate = FindReleaseGate(plan).Id,
@@ -106,7 +107,7 @@ public sealed class DevelopmentProjectAssembler
                 ".localstudio/verification/development-units.json",
                 evidenceHash,
                 state.UpdatedAt,
-                "依存関係を含む全開発単位が有限回の検証ループを通過しました。");
+                "依存関係を含む全開発単位が有限回の検証ループを通過しました（要件ごとの動作確認ではありません）。");
             var ledger = new RequirementLedgerDocument(
                 1,
                 request.ProjectId,
@@ -116,7 +117,9 @@ public sealed class DevelopmentProjectAssembler
                     pair.Key,
                     pair.Value,
                     true,
-                    RequirementState.Passed,
+                    // A shared DAG record is not evidence that this requirement works (external review 2026-10-26):
+                    // each stays NOT_TESTED until a test made for it has run.
+                    RequirementState.NotTested,
                     [evidence])).ToArray());
             await RequirementLedgerStore.SaveAtomicAsync(staging, ledger, cancellationToken);
 
@@ -152,8 +155,8 @@ public sealed class DevelopmentProjectAssembler
                 request.DesignDecisions,
                 [],
                 tests,
-                tests.Select(test => new ProjectTestResult(test.Id, "PASS", ".localstudio/verification/development-units.json", state.UpdatedAt)).ToArray(),
-                "PASS",
+                tests.Select(test => new ProjectTestResult(test.Id, "NOT_TESTED", ".localstudio/verification/development-units.json", state.UpdatedAt)).ToArray(),
+                "NOT_TESTED",
                 [],
                 [],
                 new ProjectBuildState("verified", state.UpdatedAt, sourceFingerprint),

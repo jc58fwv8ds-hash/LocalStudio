@@ -73,6 +73,7 @@ public sealed class ProjectScaffolder : IProjectScaffolder
         {
             Directory.CreateDirectory(staging);
             IReadOnlyList<GeneratedTextFile> generatedFiles;
+            var repairedByAgent = false;
             var implementationMode = implementation.Route switch
             {
                 ProjectImplementationRoute.VerifiedTemplate => "verified-template",
@@ -92,7 +93,15 @@ public sealed class ProjectScaffolder : IProjectScaffolder
                 };
                 if (generator is null)
                     throw new InvalidOperationException("この環境では自律実装用のローカルAI生成器が準備されていません。");
-                var generated = await generator.GenerateAsync(safe, kind, progress, cancellationToken, sourceRequest, steering);
+                GeneratedProjectSource generated;
+                try { generated = await generator.GenerateAsync(safe, kind, progress, cancellationToken, sourceRequest, steering); }
+                catch (InvalidDataException failed) when (failed.InnerException is GenerationExhaustedException exhausted && Repair is not null)
+                {
+                    var repaired = await RepairInStagingAsync(staging, exhausted, kind, sourceRequest, progress, cancellationToken);
+                    if (repaired is null) throw;
+                    generated = repaired;
+                    repairedByAgent = true;
+                }
                 generatedFiles = generated.Files;
                 implementationMode = generated.ImplementationMode;
             }
@@ -118,6 +127,8 @@ public sealed class ProjectScaffolder : IProjectScaffolder
                 },
                 implementationMode,
                 implementationExplanation = implementation.Explanation,
+                // The generator ran out of attempts and the agent loop repaired its last candidate in place.
+                repairedByAgent = repairedByAgent ? true : (bool?)null,
                 derivation,
                 sourceRequest = LimitSourceRequest(sourceRequest),
                 // Instructions received during generation and the attempt that applied them (travels with the cartridge).
@@ -135,8 +146,13 @@ public sealed class ProjectScaffolder : IProjectScaffolder
             {
                 var relative = ValidateGeneratedPath(generated.RelativePath);
                 if (!generatedPaths.Add(relative)) throw new InvalidDataException("同じファイルパスが重複しています。");
-                if (generated.Content.Length > 512 * 1024) throw new InvalidDataException("生成ファイルは512 KB以下に限定されています。");
-                if (generated.Content.Contains('\uFFFD') || LocalWebAppGenerationEngine.HasForbiddenControlCharacters(generated.Content))
+                // Files the AI writes stay within 512 KB; shelf libraries copied into vendor/ have the shelf's own bound.
+                var vendor = relative.StartsWith(LibraryShelf.VendorFolder + Path.DirectorySeparatorChar, StringComparison.Ordinal);
+                var bound = !vendor ? 512 * 1024 : LibraryShelf.IsFontFile(relative) ? LibraryShelf.MaxFontFileBytes : LibraryShelf.MaxFileBytes;
+                if (generated.Content.Length > bound) throw new InvalidDataException("生成ファイルは512 KB以下（ライブラリは2 MB、フォントは10 MB以下）に限定されています。");
+                if (vendor
+                        ? LibraryShelf.HasUnsafeLibraryCharacters(generated.Content)
+                        : generated.Content.Contains('\uFFFD') || LocalWebAppGenerationEngine.HasForbiddenControlCharacters(generated.Content))
                     throw new InvalidDataException("生成内容に不正なUnicode文字または制御文字が含まれています。");
                 var output = Path.Combine(staging, relative);
                 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
@@ -191,14 +207,54 @@ public sealed class ProjectScaffolder : IProjectScaffolder
                 ? "構造確認済みプレビューと復元用スナップショットを保存しています"
                 : "検証済み状態と復元用ベースラインを保存しています", 0.9));
             await CreateAcceptedBaselineAsync(staging, kind == StudioProjectKind.Agent ? "safe-scaffold" : isStructuralPreview ? "structural-preview" : "accepted", cancellationToken);
-            Directory.Move(staging, destination);
+            await DirectoryPromotion.MoveWithTransientRetryAsync(staging, destination, cancellationToken);
             progress?.Report(new("complete", "プロジェクトを安全に保存しました", 1));
             return destination;
         }
         finally
         {
-            if (Directory.Exists(staging)) Directory.Delete(staging, true);
+            if (Directory.Exists(staging))
+            {
+                try { Directory.Delete(staging, true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Never replace the real generation/promotion error with a cleanup lock. A later startup moves
+                    // old staging folders into the abandoned-staging quarantine.
+                }
+            }
         }
+    }
+
+    /// <summary>
+    /// Repairs a generator's last candidate with the agent loop (staging folder, kind, request, findings); true when it
+    /// now passes the checks. Off when null: the candidate is dropped as before.
+    /// </summary>
+    public Func<string, StudioProjectKind, string?, IReadOnlyList<string>, IProgress<ProjectCreationProgress>?, CancellationToken, Task<bool>>? Repair { get; init; }
+
+    private async Task<GeneratedProjectSource?> RepairInStagingAsync(
+        string staging, GenerationExhaustedException exhausted, StudioProjectKind kind, string? sourceRequest,
+        IProgress<ProjectCreationProgress>? progress, CancellationToken cancellationToken)
+    {
+        progress?.Report(new("agent-repair", "試行の上限に達したため、最後の案をその場で少しずつ直しています", 0.55));
+        foreach (var file in exhausted.LastCandidate.Files)
+        {
+            var output = Path.Combine(staging, ValidateGeneratedPath(file.RelativePath));
+            Directory.CreateDirectory(Path.GetDirectoryName(output)!);
+            await File.WriteAllTextAsync(output, file.Content, new UTF8Encoding(false, true), cancellationToken);
+        }
+        // The workspace session works only on LocalStudio projects; the real manifest replaces this one afterwards.
+        await File.WriteAllTextAsync(Path.Combine(staging, "localstudio.json"), "{\"schema\":1,\"lifecycle\":\"agent-repair\"}", new UTF8Encoding(false), cancellationToken);
+        if (!await Repair!(staging, kind, sourceRequest, exhausted.Failures, progress, cancellationToken)) return null;
+        var files = Directory.EnumerateFiles(staging, "*", SearchOption.AllDirectories)
+            .Select(full => Path.GetRelativePath(staging, full))
+            .Where(relative => !relative.Equals("localstudio.json", StringComparison.OrdinalIgnoreCase) &&
+                               !relative.StartsWith(".localstudio", StringComparison.OrdinalIgnoreCase) &&
+                               !ProjectFilePolicy.IsBuildOutput(relative) &&
+                               !relative.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) && !relative.EndsWith(".pdb", StringComparison.OrdinalIgnoreCase))
+            .Select(relative => new GeneratedTextFile(relative.Replace('\\', '/'), File.ReadAllText(Path.Combine(staging, relative))))
+            .ToArray();
+        progress?.Report(new("agent-repair-ready", "最後の案を直し、検査に合格しました", 0.57));
+        return new GeneratedProjectSource(files, exhausted.LastCandidate.ImplementationMode);
     }
 
     private static string ValidateGeneratedPath(string relativePath)

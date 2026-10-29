@@ -40,8 +40,14 @@ public sealed record LibraryDraft(string Name, string Version, string License, s
 /// </summary>
 public sealed class LibraryShelf(string root)
 {
-    public const long MaxFileBytes = 512 * 1024;
+    // 2 MB: PDF libraries ship single browser files of 0.5–1.1 MB (pdf-lib, the pdf.js worker; approved 2026-10-19).
+    public const long MaxFileBytes = 2L * 1024 * 1024;
     public const long MaxLibraryBytes = 2L * 1024 * 1024;
+    // Fonts travel as "*.font.js": the font file as base64 in a script, because a web app opened from this PC cannot read
+    // a font file next to it, but can load a script (Japanese fonts for PDFs, approved 2026-10-19). 10 MB holds a
+    // 6 MB TrueType font with its licence.
+    public const long MaxFontFileBytes = 10L * 1024 * 1024;
+    public const string FontGlobal = "LocalStudioFonts";
     public const int MaxFiles = 8;
     public const int MaxGuideCharacters = 1_500;
     public const string VendorFolder = "vendor";
@@ -56,6 +62,29 @@ public sealed class LibraryShelf(string root)
 
     /// <summary>Names are lower-case letters, digits and . - _ (like npm), e.g. "chart.js".</summary>
     public static bool IsValidName(string name) => Regex.IsMatch(name, @"^[a-z0-9][a-z0-9._-]{0,39}$", RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Characters a library file must not hold: NUL, and the bidirectional controls that make code read differently from
+    /// how it runs ("Trojan Source"). Other control characters are allowed here: minified libraries keep lookup tables
+    /// as raw characters in their strings (pdf-lib, the pdf.js worker; 2026-10-19), and the files are checked against the
+    /// registry's SHA-512. Code the AI writes keeps the stricter rule (HasForbiddenControlCharacters).
+    /// </summary>
+    public static bool HasUnsafeLibraryCharacters(string text) =>
+        text.Any(ch => ch == '\0' || ch is >= '\u202A' and <= '\u202E' || ch is >= '\u2066' and <= '\u2069');
+
+    public static bool IsFontFile(string fileName) => fileName.EndsWith(".font.js", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// A font as a shelf script: the licence in full as a comment, then the font bytes as base64 under
+    /// globalThis.LocalStudioFonts[family]. Apps turn it back into bytes for pdf-lib (embedFont) or FontFace.
+    /// </summary>
+    public static string WrapFont(byte[] font, string family, string licenseText)
+    {
+        if (!Regex.IsMatch(family, @"^[A-Za-z0-9 ._-]{1,60}$", RegexOptions.CultureInvariant)) throw new InvalidDataException("フォント名は英数字と空白・. - _ で60文字までにしてください。");
+        var license = licenseText.Replace("\r\n", "\n").Replace("*/", "* /", StringComparison.Ordinal);
+        return "/*! " + family + " — font data for LocalStudio apps. Licence:\n" + license.TrimEnd() + "\n*/\n" +
+               "(function () { var f = globalThis." + FontGlobal + " = globalThis." + FontGlobal + " || {}; f[\"" + family + "\"] = \"" + Convert.ToBase64String(font) + "\"; })();\n";
+    }
 
     /// <summary>Problems with a draft, in plain Japanese; empty when it can go on the shelf.</summary>
     public static IReadOnlyList<string> Check(LibraryDraft draft)
@@ -78,14 +107,15 @@ public sealed class LibraryShelf(string root)
             if (!ProjectFilePolicy.HasSafeWindowsNames(name)) { problems.Add($"{name}: ファイル名に使えない文字があります"); continue; }
             var info = new FileInfo(file);
             if (!info.Exists) { problems.Add($"{name}: 見つかりません"); continue; }
-            if (info.Length is 0 or > MaxFileBytes) { problems.Add($"{name}: 1ファイル {MaxFileBytes / 1024} KB までです"); continue; }
-            total += info.Length;
+            var bound = IsFontFile(name) ? MaxFontFileBytes : MaxFileBytes;
+            if (info.Length == 0 || info.Length > bound) { problems.Add($"{name}: 1ファイル {bound / 1024} KB までです"); continue; }
+            if (!IsFontFile(name)) total += info.Length;
             var bytes = File.ReadAllBytes(file);
             if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) { problems.Add($"{name}: BOM 付きの UTF-8 は扱いません"); continue; }
             try
             {
                 var text = StrictUtf8.GetString(bytes);
-                if (LocalWebAppGenerationEngine.HasForbiddenControlCharacters(text)) problems.Add($"{name}: 文字ではないデータが含まれています");
+                if (HasUnsafeLibraryCharacters(text)) problems.Add($"{name}: 文字ではないデータ（NUL）か、表示と中身をずらす制御文字が含まれています");
             }
             catch (DecoderFallbackException) { problems.Add($"{name}: UTF-8 の文字として読めません"); }
         }

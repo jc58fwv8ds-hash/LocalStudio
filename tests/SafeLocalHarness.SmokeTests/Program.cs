@@ -1,12 +1,15 @@
-﻿using System.IO.Compression;
+using System.IO.Compression;
 using System.Net;
+using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using SafeLocalHarness.Core;
 
+var automatedErrorDialogsSuppressed = AutomatedProcessErrorMode.SuppressWindowsErrorDialogs();
 var failures = new List<string>();
 void Check(bool condition, string name) { if (!condition) failures.Add(name); }
+Check(automatedErrorDialogsSuppressed, "automated-smoke-suppresses-windows-crash-dialogs");
 void CheckThrows(Action action, string name)
 {
     try { action(); failures.Add(name); }
@@ -451,10 +454,164 @@ var assemblyResult = await new DevelopmentProjectAssembler(new DevelopmentUnitCa
         [".NET"],
         ["dotnet build"],
         ["単一release gateが全開発単位を包含してからStableへ昇格する"]));
-Check(assemblyResult.CompletionAllowed && Directory.Exists(assembledDevelopmentProject), "development-assembler-promotes-only-complete-plan");
+// External review 2026-10-26: a passing DAG is recorded, but no requirement is called passed without its own test.
+var assembledLedger = await RequirementLedgerStore.LoadAsync(assembledDevelopmentProject);
+Check(!assemblyResult.CompletionAllowed && Directory.Exists(assembledDevelopmentProject) &&
+      assembledLedger.Items.All(item => item.State == RequirementState.NotTested && item.Evidence.Count > 0),
+    "development-assembler-records-the-dag-but-passes-no-untested-requirement");
 Check(File.Exists(Path.Combine(assembledDevelopmentProject, ".localstudio", "baseline", "manifest.json")), "development-assembler-creates-rollback-baseline");
 var assembledInspection = await ProjectCartridgeStore.InspectAsync(assembledDevelopmentProject);
-Check(assembledInspection.CanResume && assembledInspection.Cartridge.VerificationStatus == "PASS", "assembled-project-cartridge-can-resume");
+Check(assembledInspection.CanResume && assembledInspection.Cartridge.VerificationStatus == "NOT_TESTED", "assembled-project-cartridge-can-resume");
+var sessionRoot = Path.Combine(smokePaths.StateRoot, "development-session");
+var sessionDestination = Path.Combine(smokePaths.ProjectRoot, "session-service-assembled");
+var sessionStore = new DevelopmentUnitCandidateStore(Path.Combine(sessionRoot, "artifacts"));
+var sessionPlanner = new CountingDevelopmentPlanner(executionPlan);
+var sessionService = new DevelopmentSessionService(
+    sessionPlanner,
+    new DevelopmentUnitExecutionEngine(
+        new SmokeDevelopmentUnitGenerator(),
+        new FailFirstDevelopmentUnitVerifier("contracts"),
+        sessionStore),
+    sessionStore);
+var sessionRequirements = new Dictionary<string, string>(StringComparer.Ordinal)
+{
+    ["EX-001"] = "Define the domain contract",
+    ["EX-002"] = "Implement the dependency-aware pipeline"
+};
+var initialSessionRequest = new DevelopmentSessionRequest(
+    sessionRoot,
+    sessionDestination,
+    "session-service-assembled",
+    "Session service smoke",
+    "Resume a bounded development session without losing evidence.",
+    "Build a bounded local application",
+    sessionRequirements,
+    [".NET"],
+    ["dotnet build"],
+    ["A passing DAG does not replace requirement-specific evidence."],
+    executionPlan);
+var pausedSession = await sessionService.RunAsync(initialSessionRequest, maximumUnitAttempts: 1);
+Check(pausedSession.Stage == DevelopmentSessionStage.Paused &&
+      pausedSession.State.Units.Single(unit => unit.UnitId == "contracts").Status == DevelopmentUnitStatus.VerificationFailed &&
+      !Directory.Exists(sessionDestination),
+    "development-session-pauses-durably-without-assembling-a-failed-dag");
+var resumedSessionRequest = initialSessionRequest with { Plan = null };
+var resumedSession = await sessionService.RunAsync(resumedSessionRequest);
+Check(resumedSession.Stage == DevelopmentSessionStage.AssembledAwaitingRequirementEvidence &&
+      resumedSession.State.Units.All(unit => unit.Status == DevelopmentUnitStatus.Accepted) &&
+      sessionPlanner.CallCount == 0 &&
+      File.Exists(pausedSession.PlanPath) && File.Exists(pausedSession.StatePath + ".previous"),
+    "development-session-resumes-saved-plan-and-state-without-replanning");
+var sessionLedger = await RequirementLedgerStore.LoadAsync(sessionDestination);
+Check(!resumedSession.CompletionAllowed && sessionLedger.Items.All(item => item.State == RequirementState.NotTested),
+    "development-session-does-not-promote-dag-pass-to-requirement-pass");
+var reopenedSession = await sessionService.RunAsync(resumedSessionRequest);
+Check(reopenedSession.Stage == DevelopmentSessionStage.AssembledAwaitingRequirementEvidence &&
+      reopenedSession.ProjectRoot == sessionDestination && sessionPlanner.CallCount == 0,
+    "development-session-reopens-its-existing-cartridge-idempotently");
+var requirementVerifier = new ScriptedRequirementVerifier(
+    ("TEST-EX-001-STATIC", new DeterministicRequirementVerification(true, "deterministic-static", "Domain static checks passed.", Encoding.UTF8.GetBytes("EX-001-STATIC:PASS"))),
+    ("TEST-EX-002", new DeterministicRequirementVerification(false, "deterministic-unit", "Pipeline test failed.", Encoding.UTF8.GetBytes("EX-002:FAIL"))),
+    ("TEST-EX-002", new DeterministicRequirementVerification(true, "deterministic-unit", "Pipeline test passed after repair.", Encoding.UTF8.GetBytes("EX-002:PASS"))));
+await CheckThrowsAsync(
+    () => new RequirementVerificationService(requirementVerifier).VerifyAsync(sessionDestination, "TEST-EX-001"),
+    "dag-release-gate-cannot-be-used-as-requirement-specific-evidence");
+CheckThrows(
+    () => _ = new RequirementVerifierRegistry([new("dag-release-gate", requirementVerifier)]),
+    "requirement-verifier-registry-rejects-generic-dag-evidence");
+var preVerificationInspection = await ProjectCartridgeStore.InspectAsync(sessionDestination);
+var specificDefinitions = preVerificationInspection.Cartridge.TestDefinitions
+    .Select(definition => definition.RequirementId == "EX-001"
+        ? definition with
+        {
+            Kind = ProjectFileInvariantRequirementVerifier.Kind,
+            Specification = new ProjectTestSpecification(1, [
+                new("file-exists", "src/Smoke.Domain/contracts.cs"),
+                new("utf8-contains-exact", "src/Smoke.Domain/contracts.cs", "internal static class contracts")
+            ])
+        }
+        : definition with { Kind = "smoke-requirement-check" })
+    .Append(new ProjectTestDefinition(
+        "TEST-EX-001-STATIC",
+        "EX-001",
+        "smoke-requirement-check",
+        "A second independent deterministic check for the same requirement."))
+    .ToArray();
+var specificResults = specificDefinitions.Select(definition => new ProjectTestResult(
+    definition.Id,
+    "NOT_TESTED",
+    ".localstudio/verification/development-units.json",
+    preVerificationInspection.Cartridge.UpdatedAt)).ToArray();
+await ProjectCartridgeStore.SaveAtomicAsync(sessionDestination, preVerificationInspection.Cartridge with
+{
+    TestDefinitions = specificDefinitions,
+    TestResults = specificResults
+});
+var projectFileVerifier = new ProjectFileInvariantRequirementVerifier();
+var missingFileOutcome = await projectFileVerifier.VerifyAsync(
+    sessionDestination,
+    new ProjectTestDefinition(
+        "TEST-MISSING-FILE",
+        "EX-001",
+        ProjectFileInvariantRequirementVerifier.Kind,
+        "A missing file must fail without running a process.",
+        new ProjectTestSpecification(1, [new("file-exists", "src/Smoke.Domain/missing.cs")])));
+Check(!missingFileOutcome.Passed && Encoding.UTF8.GetString(missingFileOutcome.EvidenceContent.Span).Contains("file-missing", StringComparison.Ordinal),
+    "project-file-invariant-records-a-deterministic-missing-file-failure");
+await CheckThrowsAsync(
+    () => projectFileVerifier.VerifyAsync(
+        sessionDestination,
+        new ProjectTestDefinition(
+            "TEST-CONTROL-DATA",
+            "EX-001",
+            ProjectFileInvariantRequirementVerifier.Kind,
+            "Control data is not requirement evidence.",
+            new ProjectTestSpecification(1, [new("file-exists", ".localstudio/localstudio.json")]))),
+    "project-file-invariant-refuses-localstudio-control-data");
+var requirementRegistry = new RequirementVerifierRegistry([
+    new(ProjectFileInvariantRequirementVerifier.Kind, projectFileVerifier),
+    new("smoke-requirement-check", requirementVerifier)
+]);
+Check(requirementRegistry.SupportedKinds.SequenceEqual([ProjectFileInvariantRequirementVerifier.Kind, "smoke-requirement-check"]),
+    "requirement-verifier-registry-exposes-only-explicit-kinds");
+CheckThrows(
+    () => _ = new RequirementVerifierRegistry([
+        new("smoke-requirement-check", requirementVerifier),
+        new("smoke-requirement-check", requirementVerifier)
+    ]),
+    "requirement-verifier-registry-rejects-duplicate-kinds");
+await CheckThrowsAsync(
+    () => requirementRegistry.VerifyAsync(
+        sessionDestination,
+        new ProjectTestDefinition("TEST-UNSUPPORTED", "EX-001", "unknown-verifier", "Must fail closed.")),
+    "requirement-verifier-registry-has-no-unsafe-fallback");
+var requirementVerification = new RequirementVerificationService(requirementRegistry);
+await CheckThrowsAsync(
+    () => requirementVerification.VerifyAsync(sessionDestination, "TEST-UNKNOWN"),
+    "requirement-verification-refuses-tests-not-defined-by-the-cartridge");
+var firstRequirement = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-001");
+Check(firstRequirement.State == RequirementState.NotTested && !firstRequirement.CompletionAllowed,
+    "one-passing-test-does-not-pass-a-requirement-that-has-another-untested-test");
+var secondRequirementTest = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-001-STATIC");
+Check(secondRequirementTest.State == RequirementState.Passed && !secondRequirementTest.CompletionAllowed,
+    "a-requirement-passes-only-after-all-of-its-tests-pass");
+var failedRequirement = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-002");
+Check(failedRequirement.State == RequirementState.Failed && !failedRequirement.CompletionAllowed,
+    "failed-deterministic-verification-is-recorded-and-does-not-complete");
+var repairedRequirement = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-002");
+var completedLedger = await RequirementLedgerStore.LoadAsync(sessionDestination);
+var completedInspection = await ProjectCartridgeStore.InspectAsync(sessionDestination);
+var evidenceFullPath = Path.Combine(sessionDestination, repairedRequirement.EvidenceRelativePath.Replace('/', Path.DirectorySeparatorChar));
+var evidenceFileHash = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(evidenceFullPath))).ToLowerInvariant();
+Check(repairedRequirement.CompletionAllowed && repairedRequirement.State == RequirementState.Passed &&
+      RequirementLedgerPolicy.Validate(completedLedger).CompletionAllowed &&
+      RequirementLedgerPolicy.Validate(completedInspection.Cartridge.RequirementLedger).CompletionAllowed &&
+      completedInspection.Cartridge.TestResults.All(result => result.Status == "PASS") &&
+      evidenceFileHash == repairedRequirement.EvidenceSha256,
+    "deterministic-requirement-evidence-completes-only-after-all-mandatory-tests-pass");
+var completedSession = await sessionService.RunAsync(resumedSessionRequest);
+Check(completedSession.Stage == DevelopmentSessionStage.Complete && completedSession.CompletionAllowed,
+    "development-session-observes-requirement-evidence-and-transitions-to-complete");
 var contractCandidateRoot = Directory.EnumerateDirectories(Path.Combine(executionStoreRoot, "candidates", "contracts")).Single();
 var staticContractVerification = await new DevelopmentUnitStaticVerifier().VerifyAsync(executionPlan, executionPlan.Units[0], contractCandidateRoot);
 Check(staticContractVerification.Passed, "development-static-verifier-accepts-layer-safe-contract");
@@ -531,10 +688,32 @@ var stackRegistry = DevelopmentStackRegistry.CreateDefault(new DevelopmentBuildT
 var stackCapabilities = stackRegistry.InspectCapabilities();
 Check(stackCapabilities.Count == 5 && stackRegistry.Resolve("dotnet").Profile.QualifiedForStablePromotion, "stack-registry-exposes-general-capability-profiles");
 Check(!stackRegistry.Resolve("tauri").Profile.QualifiedForStablePromotion, "tauri-remains-experimental-instead-of-being-fixed-as-default");
+// A new per-run DOTNET_CLI_HOME must not add a global-tools path, create an ASP.NET development certificate, or
+// enable telemetry as a side effect. The certificate message was observed during isolated MSB3374 diagnosis on
+// 2026-10-28 when a manual command omitted these product-owned environment guards.
+var dotnetEnvironment = DotnetRestoreAdapter.EnvironmentFor(
+    new DevelopmentStackContext(pipelineBuildUnit, webPolicyRoot, stackRegistry.Toolchain));
+Check(dotnetEnvironment["DOTNET_SKIP_FIRST_TIME_EXPERIENCE"] == "1" &&
+      dotnetEnvironment["DOTNET_ADD_GLOBAL_TOOLS_TO_PATH"] == "false" &&
+      dotnetEnvironment["DOTNET_GENERATE_ASPNET_CERTIFICATE"] == "false" &&
+      dotnetEnvironment["DOTNET_CLI_TELEMETRY_OPTOUT"] == "1" &&
+      dotnetEnvironment["MSBUILDDISABLENODEREUSE"] == "1" &&
+      !string.IsNullOrWhiteSpace(dotnetEnvironment["DOTNET_CLI_HOME"]),
+    "dotnet-adapter-disables-first-run-certificate-path-and-telemetry-side-effects");
 var missingCargo = await stackRegistry.Resolve("cargo").VerifyAsync(
     new DevelopmentStackContext(webUiUnit with { BuildSystem = "cargo" }, webPolicyRoot, stackRegistry.Toolchain),
     CancellationToken.None);
 Check(!missingCargo.Passed && missingCargo.FailureKind == DevelopmentFailureKind.ToolchainMissing && missingCargo.Stage == DevelopmentPipelineStage.Capability, "stack-pipeline-classifies-missing-toolchain");
+// External review 2026-10-26: Node ran Tauri's stages (so it asked for Cargo.toml), and a unit that asked for tests
+// passed with none. A Node package with nothing to install or run never starts the executable named here.
+var nodeOnlyRoot = Path.Combine(smokePaths.StateRoot, "node-only");
+Directory.CreateDirectory(nodeOnlyRoot);
+await File.WriteAllTextAsync(Path.Combine(nodeOnlyRoot, "package.json"), "{\"name\":\"node-only\",\"version\":\"1.0.0\",\"private\":true}");
+var nodeRegistry = DevelopmentStackRegistry.CreateDefault(new DevelopmentBuildToolchain(null, Environment.ProcessPath!, null));
+var nodeBuilt = await nodeRegistry.Resolve("node").VerifyAsync(new DevelopmentStackContext(webUiUnit with { BuildSystem = "node", VerificationKind = "build" }, nodeOnlyRoot, nodeRegistry.Toolchain), CancellationToken.None);
+var nodeUntested = await nodeRegistry.Resolve("node").VerifyAsync(new DevelopmentStackContext(webUiUnit with { BuildSystem = "node", VerificationKind = "unit-test" }, nodeOnlyRoot, nodeRegistry.Toolchain), CancellationToken.None);
+Check(nodeBuilt.Passed && !nodeUntested.Passed && nodeUntested.Stage == DevelopmentPipelineStage.Test && nodeUntested.Summary.StartsWith("node.test-script-missing", StringComparison.Ordinal),
+    "node-stack-runs-node-stages-and-asked-for-tests-are-required:" + nodeBuilt.Summary + " / " + nodeUntested.Summary);
 var scriptedWebArtifact = webUiArtifact with
 {
     Files = [.. webUiArtifact.Files, new("src/TaskCreator.Presentation/app.js", "const message = 'safe'; console.log(message);")]
@@ -899,10 +1078,28 @@ try
         "single-download-path-runtime-install-method-removed");
     var setupViewModelSource = File.ReadAllText(Path.Combine(Path.GetDirectoryName(manifest)!, "ViewModels", "SetupViewModel.cs"));
     var workbenchSource = File.ReadAllText(Path.Combine(coreRoot, "..", "SafeLocalHarness.Workbench", "Program.cs"));
+    // The memory mode can be switched in the chat at any time; a stop by the memory guard offers Expert there.
+    var chatModeXaml = File.ReadAllText(Path.Combine(Path.GetDirectoryName(manifest)!, "Views", "ChatView.xaml"));
+    var chatViewModelSource = File.ReadAllText(Path.Combine(Path.GetDirectoryName(manifest)!, "ViewModels", "ChatViewModel.cs"));
+    var modeEvents = new List<ResourceMode>();
+    var modeStateForChat = new ResourceModeState(new FakeSettingsStore(new LocalStudioSettings(LocalStudioSettings.DefaultModel, ResourceMode.Focus)));
+    modeStateForChat.Changed += modeEvents.Add;
+    await modeStateForChat.SetAsync(ResourceMode.Expert);
+    Check(MemoryGuardMessages.IsRefusal("設計案を作れませんでした: ほかのアプリの未使用メモリを空けても余裕がないため、AIの処理を開始しません。メモリの確保量が上限の86%です。") &&
+          MemoryGuardMessages.IsRefusal("今の空きメモリではAIを動かせません。") && !MemoryGuardMessages.IsRefusal("完成しました。") &&
+          modeStateForChat.Current == ResourceMode.Expert && modeEvents.SequenceEqual([ResourceMode.Expert]) &&
+          chatModeXaml.Contains("CommandParameter=\"Expert\"", StringComparison.Ordinal) && chatModeXaml.Contains("{Binding ModeLabel}", StringComparison.Ordinal) &&
+          chatViewModelSource.Contains("ExpertModeWarning", StringComparison.Ordinal) && chatViewModelSource.Contains("OfferExpertIfStopped", StringComparison.Ordinal),
+        "chat-offers-memory-mode-switch-and-expert-after-a-guard-stop");
     Check(!setupViewModelSource.Contains("PullModelAsync", StringComparison.Ordinal) &&
           !workbenchSource.Contains("PullModelAsync", StringComparison.Ordinal) &&
           setupViewModelSource.Contains("CreateApproval", StringComparison.Ordinal),
         "single-download-path-setup-and-workbench-never-pull-directly");
+    Check(workbenchSource.Contains("new DevelopmentSessionService", StringComparison.Ordinal) &&
+          workbenchSource.Contains("assembled-awaiting-evidence", StringComparison.Ordinal) &&
+          !workbenchSource.Contains("new DevelopmentProjectAssembler(store)", StringComparison.Ordinal) &&
+          !workbenchSource.Contains("await executor.RunAsync(", StringComparison.Ordinal),
+        "workbench-uses-the-durable-session-service-and-does-not-call-assembly-directly");
 
     // An explicit setup run re-checks every stage, so a resumed run never lacks evidence from earlier stages.
     var restartPaths = phase1Paths with { StateRoot = Path.Combine(phase1Root, "restart-state") };
@@ -1048,6 +1245,35 @@ try
     var appCartridgeInspection = await ProjectCartridgeStore.InspectAsync(appProject);
     Check(appCartridgeInspection.CanResume && appCartridgeInspection.Cartridge.Scope == "target-project", "project-cartridge-validates-for-resume");
     Check(appCartridgeInspection.Cartridge.TaskDag.Units.Count == 3 && appCartridgeInspection.Cartridge.SourceFiles.Count >= 4, "project-cartridge-captures-task-dag-and-source-integrity");
+    var completeGrowthBlueprint = appBlueprint with
+    {
+        Name = appBlueprint.Name + " Growth",
+        Features = appBlueprint.Features.Concat(["気づきを入力して保存", "過去の日報を一覧表示"]).ToArray()
+    };
+    var (growthCore, growthLater) = FeatureGrowth.Split(completeGrowthBlueprint);
+    var growthSource = new GeneratedProjectSource(
+        taskSource.Files.Select(file => new GeneratedTextFile(file.RelativePath, file.Content.Replace(appBlueprint.Name, completeGrowthBlueprint.Name, StringComparison.Ordinal))).ToArray(),
+        taskSource.ImplementationMode);
+    var growthRecordProject = await new ProjectScaffolder(smokePaths, generativeGenerator: new FixedGenerativeProjectGenerator(growthSource))
+        .CreateAsync(growthCore, StudioProjectKind.DesktopOrWebApp);
+    await FeatureGrowth.RecordResultsAsync(growthRecordProject, completeGrowthBlueprint,
+    [
+        new(growthLater[0], true, "deterministic checks passed", 2),
+        new(growthLater[1], false, "bounded repair exhausted", 8)
+    ]);
+    var growthLedger = await RequirementLedgerStore.LoadAsync(growthRecordProject);
+    var growthInspection = await ProjectCartridgeStore.InspectAsync(growthRecordProject);
+    var growthRequirements = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(growthRecordProject, "requirements.json")));
+    var growthManifest = JsonDocument.Parse(await File.ReadAllTextAsync(Path.Combine(growthRecordProject, "localstudio.json")));
+    Check(growthLedger.Items.Count == completeGrowthBlueprint.Features.Count &&
+          growthLedger.Items.Skip(FeatureGrowth.CoreFeatures).All(item => item.State == RequirementState.NotTested && item.Evidence.Count == 0) &&
+          !RequirementLedgerPolicy.Validate(growthLedger).CompletionAllowed &&
+          growthInspection.CanResume && growthInspection.Cartridge.StructuredRequirements.SequenceEqual(completeGrowthBlueprint.Features) &&
+          growthInspection.Cartridge.PendingFeatures.Contains(growthLater[1]) &&
+          growthInspection.Cartridge.KnownIssues.Any(issue => issue.Contains(growthLater[1], StringComparison.Ordinal)) &&
+          growthRequirements.RootElement.GetProperty("requestedFeatures").GetArrayLength() == completeGrowthBlueprint.Features.Count &&
+          growthManifest.RootElement.GetProperty("blueprint").GetProperty("features").GetArrayLength() == completeGrowthBlueprint.Features.Count,
+        "split-generation-keeps-unverified-later-requirements-in-ledger-cartridge-and-portable-metadata");
     var appCartridgeJson = File.ReadAllText(Path.Combine(appProject, ".localstudio", "project-cartridge.json"));
     Check(!appCartridgeJson.Contains(appProject, StringComparison.OrdinalIgnoreCase) && appCartridgeJson.Contains("\"schemaVersion\": 1"), "project-cartridge-is-portable-and-versioned");
     var catalogProjects = new ProjectCatalog(smokePaths).GetProjects();
@@ -1377,6 +1603,24 @@ try
     Check(steeringCapture.Bodies.Count == 2 && steeringCapture.Bodies.All(body => body.Contains("additionalInstructions", StringComparison.Ordinal)) &&
           steeringInbox.Applied is [{ Attempt: 1 }] && steeringInbox.Pending.Count == 0,
         "steering-instruction-reaches-generation-and-review");
+    // Test first, end to end: examples written from the request, a wrong app sent back by them, the right one kept with them.
+    var firstCounterBlueprint = BlueprintValidator.Validate(new StudioBlueprint("カウンター", "数を数える", "app", ["ボタンを押すと数を1ずつ増やす"], [new("実装", "作る")], [], [], ["workspace.read", "workspace.write"]));
+    var counterExamples = JsonSerializer.Serialize(new { message = new { content = JsonSerializer.Serialize(new { scenarios = new[] {
+        new { requirement = "LS-REQ-001", title = "2回押すと2", steps = new object[] { new { press = "増やす" }, new { press = "増やす" } }, expect = new[] { "2回" } } } }) } });
+    const string counterBody = "<p id=\"count-view\">0回</p><button id=\"plus\" type=\"button\">増やす</button>";
+    var counterCapture = new CapturingJsonHandler(
+        counterExamples,
+        TestData.CandidateEnvelope(counterBody, "document.getElementById('plus').addEventListener('click', () => { document.getElementById('count-view').textContent = '1回'; });"),
+        TestData.CandidateEnvelope(counterBody, "let count = 0; document.getElementById('plus').addEventListener('click', () => { count += 1; document.getElementById('count-view').textContent = count + '回'; });"),
+        TestData.ReviewEnvelope("LS-REQ-001", "plus", "textContent"));
+    GeneratedProjectSource counterSource;
+    using (var counterEngine = new LocalWebAppGenerationEngine(generatedRuntime, new FakeSettingsStore(LocalStudioSettings.Default), new HttpClient(counterCapture)) { WriteAcceptance = true })
+        counterSource = await counterEngine.GenerateAsync(firstCounterBlueprint, StudioProjectKind.DesktopOrWebApp);
+    Check(counterCapture.Bodies.Count == 4 && counterCapture.Bodies[1].Contains("acceptanceChecks", StringComparison.Ordinal) &&
+          counterCapture.Bodies[2].Contains("acceptance.failed", StringComparison.Ordinal) &&
+          counterSource.Files.Any(file => file.RelativePath == AcceptanceScenario.FileName && file.Content.Contains("2回", StringComparison.Ordinal)) &&
+          counterSource.Files.Single(file => file.RelativePath == "app.js").Content.Contains("count += 1", StringComparison.Ordinal),
+        "acceptance-examples-written-first-send-back-a-wrong-app-and-keep-the-right-one");
     var recordedInbox = new SteeringInbox();
     recordedInbox.Enqueue("付箋を黄色にして");
     var steeredProject = await new ProjectScaffolder(smokePaths, generativeGenerator: new SteeringAwareGenerator(generatedSource))
@@ -1818,6 +2062,88 @@ try
           OfficeDocumentReader.Check(macroPath) is not null && OfficeDocumentReader.Check(notOffice) is not null,
         "office-files-are-read-with-computed-facts-and-unsafe-files-are-refused");
 
+    // The Excel helper given to generated EXEs (WindowsToolbox): reads workbooks as Excel writes them (shared strings,
+    // phonetic guides, gaps, formulas) and writes ones that read back the same.
+    var surveyPath = Path.Combine(officeFolder, "第一小.xlsx");
+    using (var survey = DocumentFormat.OpenXml.Packaging.SpreadsheetDocument.Create(surveyPath, DocumentFormat.OpenXml.SpreadsheetDocumentType.Workbook))
+    {
+        var book = survey.AddWorkbookPart();
+        book.Workbook = new DocumentFormat.OpenXml.Spreadsheet.Workbook();
+        var strings = book.AddNewPart<DocumentFormat.OpenXml.Packaging.SharedStringTablePart>();
+        strings.SharedStringTable = new DocumentFormat.OpenXml.Spreadsheet.SharedStringTable(
+            new DocumentFormat.OpenXml.Spreadsheet.SharedStringItem(new DocumentFormat.OpenXml.Spreadsheet.Text("学年")),
+            new DocumentFormat.OpenXml.Spreadsheet.SharedStringItem(new DocumentFormat.OpenXml.Spreadsheet.Text("満足")),
+            new DocumentFormat.OpenXml.Spreadsheet.SharedStringItem(
+                new DocumentFormat.OpenXml.Spreadsheet.Run(new DocumentFormat.OpenXml.Spreadsheet.Text("とても")),
+                new DocumentFormat.OpenXml.Spreadsheet.Run(new DocumentFormat.OpenXml.Spreadsheet.Text("良い")),
+                new DocumentFormat.OpenXml.Spreadsheet.PhoneticRun(new DocumentFormat.OpenXml.Spreadsheet.Text("ヨイ")) { BaseTextStartIndex = 3, EndingBaseIndex = 5 }));
+        var other = book.AddNewPart<DocumentFormat.OpenXml.Packaging.WorksheetPart>();
+        other.Worksheet = new DocumentFormat.OpenXml.Spreadsheet.Worksheet(new DocumentFormat.OpenXml.Spreadsheet.SheetData());
+        var answers = book.AddNewPart<DocumentFormat.OpenXml.Packaging.WorksheetPart>();
+        DocumentFormat.OpenXml.Spreadsheet.Cell Shared(string reference, int index) => new() { CellReference = reference, DataType = DocumentFormat.OpenXml.Spreadsheet.CellValues.SharedString, CellValue = new DocumentFormat.OpenXml.Spreadsheet.CellValue(index.ToString(System.Globalization.CultureInfo.InvariantCulture)) };
+        answers.Worksheet = new DocumentFormat.OpenXml.Spreadsheet.Worksheet(new DocumentFormat.OpenXml.Spreadsheet.SheetData(
+            new DocumentFormat.OpenXml.Spreadsheet.Row(Shared("A1", 0), Shared("C1", 1)) { RowIndex = 1 },
+            new DocumentFormat.OpenXml.Spreadsheet.Row(new DocumentFormat.OpenXml.Spreadsheet.Cell { CellReference = "A3", CellValue = new DocumentFormat.OpenXml.Spreadsheet.CellValue("4") }, Shared("C3", 2)) { RowIndex = 3 }));
+        book.Workbook.AppendChild(new DocumentFormat.OpenXml.Spreadsheet.Sheets(
+            new DocumentFormat.OpenXml.Spreadsheet.Sheet { Id = book.GetIdOfPart(other), SheetId = 1, Name = "説明" },
+            new DocumentFormat.OpenXml.Spreadsheet.Sheet { Id = book.GetIdOfPart(answers), SheetId = 2, Name = "回答" }));
+    }
+    var surveyRows = XlsxLite.ReadSheet(surveyPath, "回答");
+    var salesRows = XlsxLite.ReadSheet(xlsxPath);
+    var mergedPath = Path.Combine(officeFolder, "まとめ.xlsx");
+    XlsxLite.WriteSheet(mergedPath, "集計:全校", [["学校名", "学年", "回答"], ["第一小", "4", "とても良い"], ["第二小", "007", ""]]);
+    var mergedRows = XlsxLite.ReadSheet(mergedPath);
+    var mergedFacts = OfficeDocumentReader.Read(mergedPath);
+    Check(XlsxLite.SheetNames(surveyPath).SequenceEqual(["説明", "回答"]) &&
+          surveyRows.Count == 3 && surveyRows[0].SequenceEqual(["学年", "", "満足"]) && surveyRows[1].Length == 0 && surveyRows[2].SequenceEqual(["4", "", "とても良い"]) &&
+          salesRows[1].SequenceEqual(["りんご", "3", "150", "450"]) &&
+          XlsxLite.SheetNames(mergedPath).SequenceEqual(["集計全校"]) && mergedRows[2].SequenceEqual(["第二小", "007"]) && mergedRows[1][1] == "4" &&
+          mergedFacts.Sheets[0].Numeric.Any(stats => stats.Header == "学年") &&
+          WindowsToolbox.For("50個のエクセルファイルを1つにまとめる").Any(tool => tool.FileName == "XlsxLite.cs") && WindowsToolbox.For("タイマー").Count == 0 &&
+          WindowsToolbox.IsToolboxFile("XlsxLite.cs", WindowsToolbox.Source(WindowsToolbox.All[0])) && !WindowsToolbox.IsToolboxFile("XlsxLite.cs", "class X {}"),
+        "excel-helper-reads-and-writes-workbooks-for-generated-apps");
+    // An app that calls the helper builds with the Windows built-in C# 5 compiler, and the helper itself is not judged
+    // as app code (its schema URLs and file streams belong to the reviewed helper).
+    var toolboxApp = Path.Combine(officeFolder, "toolbox-app");
+    Directory.CreateDirectory(toolboxApp);
+    await File.WriteAllTextAsync(Path.Combine(toolboxApp, "Program.cs"), """
+        using System;
+        using System.Collections.Generic;
+        using System.Windows.Forms;
+        public class MergeForm : Form
+        {
+            private Button merge = new Button();
+            public MergeForm()
+            {
+                merge.Text = "まとめる";
+                merge.Click += OnMerge;
+                Controls.Add(merge);
+            }
+            private void OnMerge(object sender, EventArgs e)
+            {
+                var folder = new FolderBrowserDialog();
+                if (folder.ShowDialog() != DialogResult.OK) return;
+                var rows = new List<string[]>();
+                foreach (var path in System.IO.Directory.GetFiles(folder.SelectedPath, "*.xlsx"))
+                    rows.AddRange(XlsxLite.ReadSheet(path));
+                var save = new SaveFileDialog();
+                if (save.ShowDialog() == DialogResult.OK) XlsxLite.WriteSheet(save.FileName, "まとめ", rows);
+            }
+            [STAThread]
+            static void Main() { Application.EnableVisualStyles(); Application.Run(new MergeForm()); }
+        }
+        """);
+    await File.WriteAllTextAsync(Path.Combine(toolboxApp, "app.manifest"), WindowsApplicationManifest.Content);
+    foreach (var helper in WindowsToolbox.Files(WindowsToolbox.For("エクセル")))
+        await File.WriteAllTextAsync(Path.Combine(toolboxApp, helper.RelativePath), helper.Content);
+    string? toolboxBuild = null;
+    try { await new WindowsExecutableCompiler().CompileAsync(toolboxApp); }
+    catch (Exception ex) when (ex is InvalidDataException or WindowsBuildEnvironmentException) { toolboxBuild = ex.Message; }
+    Check(toolboxBuild is null && !WindowsToolbox.AppSources(toolboxApp).Contains("XlsxLite.ReadSheet(string path)", StringComparison.Ordinal) &&
+          WindowsToolbox.AppSources(toolboxApp).Contains("class MergeForm", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ValidateSource(WindowsToolbox.AppSources(toolboxApp)).Count == 0,
+        "generated-app-builds-with-the-excel-helper-using-the-windows-compiler:" + toolboxBuild);
+
     var docHashBefore = Convert.ToHexString(SHA256.HashData(await File.ReadAllBytesAsync(docPath)));
     var docPreview = OfficeEditor.Preview(docPath, [new OfficeEdit("replace", Find: "見積案", With: "確定版")]);
     var docResult = OfficeEditor.Apply(docPreview);
@@ -2034,7 +2360,7 @@ try
             }
         }
         """);
-    Check(designerStyle.Fixes.SequenceEqual(["interpolated-strings", "out-variables", "designer-call", "partial-class", "entry-point"]) &&
+    Check(designerStyle.Fixes.SequenceEqual(["interpolated-strings", "out-variables", "designer-call", "partial-class", "entry-point", "error-message"]) &&
           designerStyle.Source.Contains("string.Format(\"残り時間: {0} 秒 ({1:F1} 分) {{ok}}\", left, left / 60.0)", StringComparison.Ordinal) &&
           designerStyle.Source.Contains("int minutes;", StringComparison.Ordinal) && designerStyle.Source.Contains("out minutes)", StringComparison.Ordinal) &&
           !designerStyle.Source.Contains("InitializeComponent", StringComparison.Ordinal) && !designerStyle.Source.Contains("partial", StringComparison.Ordinal) &&
@@ -2791,6 +3117,21 @@ try
           autoFixed.JavaScript.Contains("a.innerHTML == b", StringComparison.Ordinal) &&
           markupKept.Fixes == 0,
         "auto-fix-only-applies-strictly-safer-rewrites");
+    var rowFixed = GeneratedScriptAutoFix.Apply("row.innerHTML = `<td>${e.date}</td><td>${e.amount}円</td>`;\n");
+    var attrKept = GeneratedScriptAutoFix.Apply("row.innerHTML = `<td class=\"x\">${e.date}</td>`;\n");
+    Check(rowFixed.Fixes == 1 && rowFixed.JavaScript.Contains("row.replaceChildren(...[[\"td\", `${e.date}`], [\"td\", `${e.amount}円`]]", StringComparison.Ordinal) &&
+          !rowFixed.JavaScript.Contains("innerHTML", StringComparison.Ordinal) && attrKept.Fixes == 0,
+        "auto-fix-turns-simple-template-rows-into-elements");
+    var newlineFixed = GeneratedScriptAutoFix.Apply("const lines = text.split('\n');\nconst ok = \"\n\";");
+    Check(newlineFixed.JavaScript == "const lines = text.split('\\n');\nconst ok = \"\\n\";" && newlineFixed.Fixes == 2, "auto-fix-mends-a-quoted-line-break");
+    var constFixed = GeneratedScriptAutoFix.Apply("const entries = load();\nconst total = 0;\nconst f = x => x;\nclear.addEventListener('click', () => { entries = []; if (total == 0) {} });");
+    Check(constFixed.JavaScript.Contains("let entries = load();", StringComparison.Ordinal) && constFixed.JavaScript.Contains("const total = 0;", StringComparison.Ordinal) && constFixed.JavaScript.Contains("const f = x => x;", StringComparison.Ordinal),
+        "auto-fix-turns-a-reassigned-const-into-let");
+    var pdfFixed = GeneratedScriptAutoFix.Apply("const a = await pdfjsLib.getDocument({ data: bytes }).promise;\nconst b = await pdfjsLib.getDocument(buffer).promise;\nconst c = await pdfjsLib.getDocument({ data: x, isEvalSupported: false }).promise;\n").JavaScript;
+    Check(pdfFixed.Contains("pdfjsLib.getDocument({ isEvalSupported: false, data: bytes })", StringComparison.Ordinal) &&
+          pdfFixed.Contains("pdfjsLib.getDocument({ data: buffer, isEvalSupported: false })", StringComparison.Ordinal) &&
+          pdfFixed.Contains("pdfjsLib.getDocument({ data: x, isEvalSupported: false })", StringComparison.Ordinal),
+        "auto-fix-opens-pdfjs-documents-without-script-evaluation:" + pdfFixed);
     const string wholeDocument = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>t</title><style>#out { color: red; }</style></head>" +
         "<body><button id=\"go\">押す</button><p id=\"out\"></p><script>document.getElementById('go').addEventListener('click', () => {});</script></body></html>";
     var split = GeneratedDocumentSplitter.Apply(new GeneratedWebAppCandidate(wholeDocument, ""));
@@ -2852,6 +3193,29 @@ try
             .Concat(LocalWebAppGenerationEngine.ValidateReview(compiled.Evidence, compiled.Candidate, requirements)).ToArray();
         if (candidateErrors.Length > 0) return caseId + ":candidate:" + string.Join("|", candidateErrors);
         var source = new GeneratedProjectSource(LocalWebAppGenerationEngine.PackageFiles(blueprint, compiled.Candidate, requirements, compiled.Evidence), "generated-local-web-app");
+        if (caseId == "counter")
+        {
+            // A generator that ran out of attempts hands its last candidate to the repair, which works in staging.
+            var broken = source with { Files = source.Files.Select(file => file.RelativePath == "app.js" ? file with { Content = file.Content + "\n(" } : file).ToArray() };
+            var repairs = 0;
+            var repairing = new ProjectScaffolder(conversationPaths, generativeGenerator: new ExhaustedGenerator(broken))
+            {
+                Repair = async (staging, _, _, findings, _, token) =>
+                {
+                    repairs++;
+                    var js = Path.Combine(staging, "app.js");
+                    await File.WriteAllTextAsync(js, (await File.ReadAllTextAsync(js, token)).TrimEnd('(', '\n') + "\n", token);
+                    return File.Exists(Path.Combine(staging, "localstudio.json")) && findings.SequenceEqual(["broken script"]);
+                }
+            };
+            var repaired = await repairing.CreateAsync(blueprint, StudioProjectKind.DesktopOrWebApp);
+            var refused = false;
+            try { await new ProjectScaffolder(conversationPaths, generativeGenerator: new ExhaustedGenerator(broken)) { Repair = (_, _, _, _, _, _) => Task.FromResult(false) }.CreateAsync(blueprint, StudioProjectKind.DesktopOrWebApp); }
+            catch (InvalidDataException failed) when (failed.InnerException is GenerationExhaustedException) { refused = true; }
+            Check(repairs == 1 && refused && File.ReadAllText(Path.Combine(repaired, "localstudio.json")).Contains("\"repairedByAgent\": true", StringComparison.Ordinal) &&
+                  !File.ReadAllText(Path.Combine(repaired, "app.js")).TrimEnd().EndsWith('('),
+                "exhausted-candidate-is-repaired-in-staging-or-dropped");
+        }
         string project;
         try { project = await new ProjectScaffolder(conversationPaths, generativeGenerator: new FixedGenerativeProjectGenerator(source)).CreateAsync(blueprint, StudioProjectKind.DesktopOrWebApp); }
         catch (InvalidDataException exception) { return caseId + ":verifier:" + exception.Message; }
@@ -3000,6 +3364,10 @@ try
           (await VerifyGasAsync("function run() { UrlFetchApp.fetch('https://example.invalid'); }", ["https://www.googleapis.com/auth/script.external_request"], approved: true)).Passed &&
           gasDynamic.Errors.Contains("gas.no-dynamic-code"),
         "gas-static-check-matches-scopes-to-services:" + string.Join("|", gasOk.Errors));
+    var gasBroken = await VerifyGasAsync("function run() { const sheet = SpreadsheetApp.getActiveSheet(; }", [sheetScope]);
+    Check(!gasBroken.Passed && gasBroken.Errors.Any(error => error.StartsWith("gas.syntax:Code.gs:", StringComparison.Ordinal)) &&
+          gasOk.PassedChecks.Contains("gas.syntax-valid"),
+        "gas-script-that-does-not-parse-is-refused:" + string.Join("|", gasBroken.Errors));
 
     await File.WriteAllTextAsync(Path.Combine(gasRoot, "Code.gs"), "function main() { SpreadsheetApp.getActiveSheet(); }\n");
     await File.WriteAllTextAsync(Path.Combine(gasRoot, "Util.gs"), "function helper() { return 1; }\n");
@@ -3159,6 +3527,547 @@ try
     Check(LocalStudioBenchmark.Score([perfect]).Total == 100 && LocalStudioBenchmark.Score([failed]).Total == 0 &&
           LocalStudioBenchmark.Score([perfect, failed]).Total == 50,
         "benchmark-score-weights-quality-time-memory-repairs");
+    // A requirement that needs a mechanism (sound, print, download, file input, chart, saving) is not met by its words
+    // alone: the silent metronome of catalogue 2026-10-19 is refused, the one that makes a sound passes.
+    var metronomeRequirements = new[] { new GeneratedRequirement("LS-REQ-002", "拍に合わせて音を鳴らす"), new GeneratedRequirement("LS-REQ-003", "テンポを表示する") };
+    var silentMetronome = "setInterval(() => { beat.textContent = '拍'; }, 500);";
+    var soundingMetronome = "start.addEventListener('click', () => { const ctx = new AudioContext(); setInterval(() => { const o = ctx.createOscillator(); o.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.05); }, 500); });";
+    Check(LocalWebAppGenerationEngine.RequirementsWithoutMechanism(metronomeRequirements, "<p id=\"beat\"></p>", silentMetronome).SingleOrDefault()?.StartsWith("requirement.mechanism-missing:LS-REQ-002:sound", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism(metronomeRequirements, "<p id=\"beat\"></p>", soundingMetronome).Count == 0 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "請求書を印刷できる")], "<button id=\"p\">印刷</button>", "").Count == 1 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "請求書を印刷できる")], "", "p.addEventListener('click', () => window.print());").Count == 0,
+        "requirements-needing-a-mechanism-are-not-met-by-words-alone");
+    // "文字の削除" and "別名で保存" in a PDF editor are not about data kept in the browser.
+    var pdfEditorContracts = LocalWebAppGenerationEngine.ValidateKnownBehaviorContracts("const pdf = await PDFLib.PDFDocument.load(bytes); link.download = 'edited.pdf';",
+        [new GeneratedRequirement("LS-REQ-001", "文字の削除・書き換え"), new GeneratedRequirement("LS-REQ-002", "別名で保存")]);
+    var memoContracts = LocalWebAppGenerationEngine.ValidateKnownBehaviorContracts("localStorage.setItem('m', JSON.stringify(memos)); memos = JSON.parse(localStorage.getItem('m'));",
+        [new GeneratedRequirement("LS-REQ-001", "メモの保存"), new GeneratedRequirement("LS-REQ-002", "メモの削除")]);
+    var memoFilterDelete = LocalWebAppGenerationEngine.ValidateKnownBehaviorContracts("memos = memos.filter((m, i) => i !== index); localStorage.setItem('m', JSON.stringify(memos)); localStorage.getItem('m');",
+        [new GeneratedRequirement("LS-REQ-001", "メモの保存"), new GeneratedRequirement("LS-REQ-002", "メモの削除")]);
+    Check(!pdfEditorContracts.Any(error => error.StartsWith("behavior.local", StringComparison.Ordinal)) && memoContracts.Contains("behavior.local-delete") && !memoFilterDelete.Contains("behavior.local-delete"),
+        "browser-storage-contracts-apply-only-to-browser-storage");
+    var soundReport = await WebAppBehaviorChecker.CheckPageAsync("<button id=\"start\">スタート</button><p id=\"beat\"></p>", "document.getElementById('start').addEventListener('click', () => { const ctx = new AudioContext(); const o = ctx.createOscillator(); o.connect(ctx.destination); o.start(); o.stop(ctx.currentTime + 0.05); new Audio('a.wav').play(); document.getElementById('beat').textContent = '拍'; });", []);
+    Check(soundReport.LoadError is null && !soundReport.Problems.Any(problem => problem.Contains("not defined", StringComparison.Ordinal)), "behavior-check-accepts-sound-without-playing-it:" + string.Join("|", soundReport.Problems));
+    var downloadReport = await WebAppBehaviorChecker.CheckPageAsync("<button id=\"save\">CSVを保存</button>", "document.getElementById('save').addEventListener('click', () => { const blob = new Blob(['a,b\\n1,2'], { type: 'text/csv' }); const link = document.createElement('a'); link.href = URL.createObjectURL(blob); link.download = 'clean.csv'; link.click(); URL.revokeObjectURL(link.href); });", []);
+    Check(downloadReport.LoadError is null && !downloadReport.Problems.Any(problem => problem.Contains("constructor", StringComparison.OrdinalIgnoreCase) || problem.Contains("not defined", StringComparison.Ordinal)), "behavior-check-accepts-downloads-without-writing-files:" + string.Join("|", downloadReport.Problems));
+    // Acceptance scenarios catch apps that run but do the wrong thing (catalogue 2026-10-20: a converter whose result was
+    // its input, a metronome that sounded once).
+    var converterScenario = new AcceptanceScenario("LS-REQ-001", "1kmをmに変換", [
+        new AcceptanceStep(Set: "長さ", Value: "1"), new AcceptanceStep(Choose: "変換元", Option: "km"), new AcceptanceStep(Choose: "変換先", Option: "m"), new AcceptanceStep(Press: "変換")], ["1000"]);
+    const string converterBody = "<label for=\"len\">長さ</label><input id=\"len\" type=\"number\"><label for=\"from\">変換元</label><select id=\"from\"><option>mm</option><option>m</option><option>km</option></select>" +
+                                 "<label for=\"to\">変換先</label><select id=\"to\"><option>mm</option><option>m</option><option>km</option></select><button id=\"go\">変換</button><p id=\"out\"></p>";
+    const string rates = "const r = { mm: 1, m: 1000, km: 1000000 };";
+    var converterPage = $"<!doctype html><html><body><main id=\"app\">{converterBody}</main></body></html>";
+    var sameUnit = await WebAppBehaviorChecker.CheckScenariosAsync(converterPage, rates + " document.getElementById('go').addEventListener('click', () => { const v = parseFloat(document.getElementById('len').value); const f = document.getElementById('from').value; const t = document.getElementById('from').value; document.getElementById('out').textContent = (v * r[f] / r[t]) + ' ' + t; });", [], [converterScenario]);
+    var rightUnit = await WebAppBehaviorChecker.CheckScenariosAsync(converterPage, rates + " document.getElementById('go').addEventListener('click', () => { const v = parseFloat(document.getElementById('len').value); const f = document.getElementById('from').value; const t = document.getElementById('to').value; document.getElementById('out').textContent = (v * r[f] / r[t]) + ' ' + t; });", [], [converterScenario]);
+    var noField = await WebAppBehaviorChecker.CheckScenariosAsync("<!doctype html><html><body><main id=\"app\"><button id=\"go\">変換</button></main></body></html>", "", [], [converterScenario]);
+    var keptScenario = new AcceptanceScenario("LS-REQ-002", "開き直しても残る", [new AcceptanceStep(Set: "メモ", Value: "買い物"), new AcceptanceStep(Press: "追加"), new AcceptanceStep(Reload: true)], ["買い物"]);
+    var memoPage = "<!doctype html><html><body><main id=\"app\"><input id=\"memo\" placeholder=\"メモ\"><button id=\"add\">追加</button><ul id=\"list\"></ul></main></body></html>";
+    const string memoShow = "const show = () => { const l = document.getElementById('list'); l.replaceChildren(); items.forEach(t => { const li = document.createElement('li'); li.textContent = t; l.append(li); }); };";
+    var notKept = await WebAppBehaviorChecker.CheckScenariosAsync(memoPage, "const items = []; " + memoShow + " document.getElementById('add').addEventListener('click', () => { items.push(document.getElementById('memo').value); show(); });", [], [keptScenario]);
+    var kept = await WebAppBehaviorChecker.CheckScenariosAsync(memoPage, "const items = JSON.parse(localStorage.getItem('m') || '[]'); " + memoShow + " show(); document.getElementById('add').addEventListener('click', () => { items.push(document.getElementById('memo').value); localStorage.setItem('m', JSON.stringify(items)); show(); });", [], [keptScenario]);
+    var oneBeat = await WebAppBehaviorChecker.CheckPageAsync("<!doctype html><html><body><main id=\"app\"><button id=\"start\">スタート</button><p id=\"beat\"></p></main></body></html>",
+        "const ctx = new AudioContext(); const osc = ctx.createOscillator(); osc.connect(ctx.destination); document.getElementById('start').addEventListener('click', () => { setInterval(() => { osc.start(); osc.stop(ctx.currentTime + 0.05); document.getElementById('beat').textContent = '拍'; }, 500); });", []);
+    Check(sameUnit.Count == 1 && sameUnit[0].StartsWith("acceptance.failed:1kmをmに変換", StringComparison.Ordinal) && rightUnit.Count == 0 &&
+          noField.Count == 1 && noField[0].StartsWith("acceptance.control-missing", StringComparison.Ordinal) &&
+          notKept.Count == 1 && kept.Count == 0 &&
+          oneBeat.Problems.Any(problem => problem.Contains("start() can only be called once", StringComparison.Ordinal)),
+        "acceptance-scenarios-catch-apps-that-run-but-do-the-wrong-thing:" + string.Join(" | ", sameUnit.Concat(rightUnit).Concat(noField).Concat(notKept).Concat(kept)) + " || " + string.Join("|", oneBeat.Problems));
+    var pdfBlueprint = BlueprintValidator.Validate(new StudioBlueprint("PDFビューア", "PDFを表示", "app", ["PDFを表示する"], [new("実装", "作る")], [], [], []));
+    var pdfRequirements = LocalWebAppGenerationEngine.RequirementsFor(pdfBlueprint);
+    GeneratedWebAppCandidate PdfCandidate(string open) => new("<main><input id=\"file\" type=\"file\" aria-label=\"PDFを表示する\"><canvas id=\"page\"></canvas></main>",
+        "document.getElementById('file').addEventListener('change', async (e) => { const bytes = new Uint8Array(await e.target.files[0].arrayBuffer()); const pdf = await " + open + ".promise; });");
+    Check(LocalWebAppGenerationEngine.ValidateCandidate(PdfCandidate("pdfjsLib.getDocument({ data: bytes })"), pdfBlueprint, pdfRequirements).Any(error => error.StartsWith("library.pdfjs-unsafe", StringComparison.Ordinal)) &&
+          !LocalWebAppGenerationEngine.ValidateCandidate(PdfCandidate("pdfjsLib.getDocument({ data: bytes, isEvalSupported: false })"), pdfBlueprint, pdfRequirements).Any(error => error.StartsWith("library.pdfjs-unsafe", StringComparison.Ordinal)),
+        "pdfjs-documents-are-opened-without-script-evaluation");
+    Check(!LibraryShelf.HasUnsafeLibraryCharacters("var t='\u0001\u0017\uFFFD';") && LibraryShelf.HasUnsafeLibraryCharacters("a\0b") && LibraryShelf.HasUnsafeLibraryCharacters("if (x) { /* \u202E */ }"),
+        "shelf-libraries-may-hold-raw-tables-but-not-nul-or-bidi-controls");
+    // Fonts go on the shelf as *.font.js (base64 under globalThis.LocalStudioFonts, licence in full as a comment).
+    var fontScript = LibraryShelf.WrapFont([0, 1, 2, 250], "BIZ UDGothic", "SIL Open Font License 1.1 */ end");
+    var fontFolder = Path.Combine(Path.GetTempPath(), "ls-font-shelf-" + Guid.NewGuid().ToString("N")[..8]);
+    Directory.CreateDirectory(fontFolder);
+    var fontPath = Path.Combine(fontFolder, "BIZUDGothic-Regular.font.js");
+    await File.WriteAllTextAsync(fontPath, fontScript);
+    Check(fontScript.Contains("f[\"BIZ UDGothic\"] = \"AAEC+g==\"", StringComparison.Ordinal) && fontScript.Contains("SIL Open Font License 1.1 * / end", StringComparison.Ordinal) &&
+          LibraryShelf.IsFontFile("x.font.js") && !LibraryShelf.IsFontFile("x.js") &&
+          LibraryShelf.Check(new LibraryDraft("biz-udgothic", "gf-dd215603", "OFL-1.1", "google/fonts", LibraryShelf.FontGlobal, [fontPath], "使い方")).Count == 0 &&
+          NpmLibrarySource.IsValidPackageName("@pdf-lib/fontkit") && NpmLibrarySource.ShelfName("@pdf-lib/fontkit") == "pdf-lib-fontkit" && !NpmLibrarySource.IsValidPackageName("@x/../y"),
+        "fonts-and-scoped-packages-go-on-the-shelf");
+    var catalogExcel = RequirementsCatalog.Cases.Single(item => item.Id == "excel-merge-50");
+    var catalogScores = RequirementsCatalog.Score([
+        new CatalogRun("a", "x", "w", "s", true, true, [], 1, 1, null), new CatalogRun("b", "x", "w", "s", false, false, ["not-created"], 1, 1, null),
+        new CatalogRun("c", "y", "w", "s", true, true, [], 1, 1, null)]);
+    Check(RequirementsCatalog.Cases.Select(item => item.Id).Distinct().Count() == RequirementsCatalog.Cases.Count &&
+          RequirementsCatalog.Cases.Select(item => item.Category).Distinct().Count() >= 8 &&
+          RequirementsCatalog.Cases.Any(item => item.Id == "desktop-suggest") && RequirementsCatalog.Cases.Any(item => item.Id == "pdf-editor") &&
+          RequirementsCatalog.Gaps(catalogExcel).Count == 0 && RequirementsCatalog.Gaps(RequirementsCatalog.Cases.Single(item => item.Id == "pdf-editor")).Count == 0 &&
+          RequirementsCatalog.Select("kind:WindowsApp").All(item => item.Kind == StudioProjectKind.WindowsApp) &&
+          RequirementsCatalog.Select("size:Large").Count == 3 &&
+          catalogScores[0].Category == "x" && catalogScores[0].PassRate == 50 && catalogScores[1].PassRate == 100,
+        "requirements-catalogue-covers-office-and-other-apps-with-per-category-rates");
+    // The catalogue's verdict is honest: a converter that converts is verified, one that echoes its input is wrong,
+    // and an EXE that only compiled is unverified, never passed (audit 2026-10-20).
+    var unitCase = RequirementsCatalog.Cases.Single(item => item.Id == "unit-convert");
+    var judgeRoot = Path.Combine(conversationPaths.ProjectRoot, "catalog-judge");
+    async Task<CatalogVerdict> JudgeWebAsync(string folder, string conversion)
+    {
+        var project = Path.Combine(judgeRoot, folder);
+        Directory.CreateDirectory(project);
+        const string units = "<option>mm</option><option>cm</option><option>m</option><option>km</option><option>g</option><option>kg</option>";
+        await File.WriteAllTextAsync(Path.Combine(project, "index.html"),
+            $"<!doctype html><html><body><div id=\"app\"><label for=\"v\">値</label><input id=\"v\"><label for=\"from-unit\">変換元</label><select id=\"from-unit\">{units}</select>" +
+            $"<label for=\"to-unit\">変換先</label><select id=\"to-unit\">{units}</select><button id=\"go\">変換</button><p id=\"out\"></p></div><script src=\"app.js\"></script></body></html>");
+        await File.WriteAllTextAsync(Path.Combine(project, "app.js"),
+            "const f = { mm: 0.001, cm: 0.01, m: 1, km: 1000, g: 1, kg: 1000 };\n" +
+            "document.getElementById('go').addEventListener('click', () => {\n const v = Number(document.getElementById('v').value);\n" +
+            " const from = document.getElementById('from-unit').value;\n const to = document.getElementById('to-unit').value;\n" +
+            $" document.getElementById('out').textContent = ({conversion}) + ' ' + to;\n}});\n");
+        return await RequirementsCatalog.JudgeAsync(unitCase, project);
+    }
+    var convertsRight = await JudgeWebAsync("right", "v * f[from] / f[to]");
+    var echoesInput = await JudgeWebAsync("echo", "v");
+    var exeOnly = Path.Combine(judgeRoot, "exe");
+    Directory.CreateDirectory(exeOnly);
+    await File.WriteAllTextAsync(Path.Combine(exeOnly, "Program.cs"), "class F : Form { Button go = new Button(); F() { Controls.Add(go); go.Click += (s, e) => Convert(); } void Convert() { } }");
+    var exeVerdict = await RequirementsCatalog.JudgeAsync(unitCase, exeOnly);
+    var honestScores = RequirementsCatalog.Score([
+        new CatalogRun("a", "x", "w", "s", true, true, [], 1, 1, null, CatalogVerdict.Verified), new CatalogRun("b", "x", "w", "s", true, false, [], 1, 1, null, CatalogVerdict.Unverified),
+        new CatalogRun("c", "x", "w", "s", true, false, ["m"], 1, 1, null, CatalogVerdict.Wrong)]);
+    Check(convertsRight.Verdict == CatalogVerdict.Verified && echoesInput.Verdict == CatalogVerdict.Wrong &&
+          echoesInput.Misses.Any(miss => miss.StartsWith("acceptance.failed:", StringComparison.Ordinal)) &&
+          exeVerdict.Verdict == CatalogVerdict.Unverified &&
+          honestScores[0].Passed == 1 && honestScores[0].Unverified == 1 && honestScores[0].Wrong == 1 && Math.Abs(honestScores[0].PassRate - 33.3) < 0.01,
+        "catalogue-verdict-is-verified-only-when-seen-working:" + convertsRight.Verdict + "/" + string.Join("|", convertsRight.Misses) + "/" + echoesInput.Verdict + "/" + exeVerdict.Verdict);
+    // Days really pass for a streak: a tracker that counts days is verified, one that counts checked habits is wrong.
+    var habitCase = RequirementsCatalog.Cases.Single(item => item.Id == "habit");
+    async Task<CatalogVerdict> JudgeHabitAsync(string folder, string onDone, string shown)
+    {
+        var project = Path.Combine(judgeRoot, folder);
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(Path.Combine(project, "index.html"),
+            "<!doctype html><html><body><div id=\"app\"><label for=\"h\">習慣</label><input id=\"h\"><button id=\"add\">追加</button><ul id=\"list\"></ul></div><script src=\"app.js\"></script></body></html>");
+        await File.WriteAllTextAsync(Path.Combine(project, "app.js"),
+            "const list = document.getElementById('list');\nconst habits = JSON.parse(localStorage.getItem('habits') || '[]');\n" +
+            "const today = () => new Date(Date.now()).toISOString().slice(0, 10);\n" +
+            "function streak(days) { let n = 0; let d = new Date(today()); while (days.includes(d.toISOString().slice(0, 10))) { n++; d = new Date(d.getTime() - 86400000); } return n; }\n" +
+            "function save() { localStorage.setItem('habits', JSON.stringify(habits)); }\n" +
+            "function render() { list.replaceChildren(); habits.forEach(h => { const li = document.createElement('li'); const s = document.createElement('span'); s.textContent = " + shown + "; const b = document.createElement('button'); b.textContent = 'できた';\n" +
+            " b.addEventListener('click', () => { " + onDone + " save(); render(); }); li.append(s, b); list.append(li); }); }\n" +
+            "document.getElementById('add').addEventListener('click', () => { habits.push({ name: document.getElementById('h').value, days: [], done: false }); save(); render(); });\nrender();\n");
+        return await RequirementsCatalog.JudgeAsync(habitCase, project);
+    }
+    // A chosen file and the file made for download are played too: a cleaner that keeps duplicates is wrong.
+    var csvCase = RequirementsCatalog.Cases.Single(item => item.Id == "csv-clean");
+    async Task<CatalogVerdict> JudgeCsvAsync(string folder, string read, string keep)
+    {
+        var project = Path.Combine(judgeRoot, folder);
+        Directory.CreateDirectory(project);
+        await File.WriteAllTextAsync(Path.Combine(project, "index.html"),
+            "<!doctype html><html><body><div id=\"app\"><label for=\"csv\">CSVファイル</label><input type=\"file\" id=\"csv\"><button id=\"dl\">ダウンロード</button><pre id=\"out\"></pre></div><script src=\"app.js\"></script></body></html>");
+        await File.WriteAllTextAsync(Path.Combine(project, "app.js"),
+            "let cleaned = '';\nfunction clean(text) { const seen = new Set(); const rows = [];\n" +
+            " for (const raw of text.split(/\\r?\\n/)) { const line = raw.split(',').map(c => c.trim()).join(','); if (!line.replace(/,/g, '').trim()) continue; if (" + keep + ") continue; seen.add(line); rows.push(line); }\n" +
+            " cleaned = rows.join('\\n'); document.getElementById('out').textContent = cleaned; }\n" +
+            read + "\n" +
+            "document.getElementById('dl').addEventListener('click', () => { const blob = new Blob([cleaned], { type: 'text/csv' }); const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'clean.csv'; a.click(); });\n");
+        return await RequirementsCatalog.JudgeAsync(csvCase, project);
+    }
+    const string readWithText = "document.getElementById('csv').addEventListener('change', async (e) => { clean(await e.target.files[0].text()); });";
+    const string readWithReader = "document.getElementById('csv').addEventListener('change', (e) => { const reader = new FileReader(); reader.onload = () => clean(reader.result); reader.readAsText(e.target.files[0]); });";
+    var csvRight = await JudgeCsvAsync("csv-right", readWithText, "seen.has(line)");
+    var csvReader = await JudgeCsvAsync("csv-reader", readWithReader, "seen.has(line)");
+    var csvKeepsDuplicates = await JudgeCsvAsync("csv-dup", readWithText, "false");
+    Check(csvRight.Verdict == CatalogVerdict.Verified && csvReader.Verdict == CatalogVerdict.Verified && csvKeepsDuplicates.Verdict == CatalogVerdict.Wrong &&
+          csvKeepsDuplicates.Misses.Any(miss => miss.Contains("more than once", StringComparison.Ordinal)),
+        "chosen-file-and-downloaded-file-are-played:" + csvRight.Verdict + "/" + string.Join("|", csvRight.Misses) + "/" + csvReader.Verdict + "/" + string.Join("|", csvReader.Misses) + "/" + csvKeepsDuplicates.Verdict);
+    // PDF editing in place (指示書 phase 0): text changed inside its show command with the font's own letters, a rule's
+    // thickness changed under a scaled drawing, and a white box over the text is not taken for a deletion.
+    PdfMarkup.EnsureFont();
+    var inPlaceRoot = Path.Combine(judgeRoot, "ls-pdf-inplace");
+    Directory.CreateDirectory(inPlaceRoot);
+    var inPlaceSource = Path.Combine(inPlaceRoot, "source.pdf");
+    using (var made = new PdfSharp.Pdf.PdfDocument())
+    {
+        var madePage = made.AddPage();
+        using var graphics = PdfSharp.Drawing.XGraphics.FromPdfPage(madePage);
+        var font = new PdfSharp.Drawing.XFont("LocalStudio Gothic", 12);
+        graphics.DrawString("開会挨拶と閉会", font, PdfSharp.Drawing.XBrushes.Black, 50, 100);
+        graphics.DrawString("研修日程", font, PdfSharp.Drawing.XBrushes.Black, 50, 140);
+        graphics.DrawString("摘　要", font, PdfSharp.Drawing.XBrushes.Black, 50, 180); // a heading with a space drawn between its letters
+        graphics.ScaleTransform(0.25);
+        graphics.DrawRectangle(PdfSharp.Drawing.XBrushes.Black, 200, 800, 1200, 2); // a 0.5 pt rule drawn at a quarter scale
+        made.Save(inPlaceSource);
+    }
+    var replaced = Path.Combine(inPlaceRoot, "replaced.pdf");
+    var replaceResult = PdfInPlaceEdit.ReplaceText(inPlaceSource, replaced, 1, "閉会", "開会");
+    var replaceCheck = replaceResult.Done ? PdfInPlaceEdit.Verify(inPlaceSource, replaced, 1, expected: "開会", removed: "閉会", find: "閉会") : new PdfEditVerification(false, ["not done"]);
+    var missingLetter = PdfInPlaceEdit.ReplaceText(inPlaceSource, Path.Combine(inPlaceRoot, "missing.pdf"), 1, "閉会", "閉幕");
+    var covered = Path.Combine(inPlaceRoot, "covered.pdf");
+    using (var cover = PdfSharp.Pdf.IO.PdfReader.Open(inPlaceSource, PdfSharp.Pdf.IO.PdfDocumentOpenMode.Modify))
+    {
+        using (var graphics = PdfSharp.Drawing.XGraphics.FromPdfPage(cover.Pages[0]))
+        {
+            graphics.DrawRectangle(PdfSharp.Drawing.XBrushes.White, 120, 85, 40, 20);
+            graphics.DrawString("開会", new PdfSharp.Drawing.XFont("LocalStudio Gothic", 12), PdfSharp.Drawing.XBrushes.Black, 122, 100);
+        }
+        cover.Save(covered);
+    }
+    var coverCheck = PdfInPlaceEdit.Verify(inPlaceSource, covered, 1, expected: "開会", removed: "閉会", find: "閉会");
+    var ruled = Path.Combine(inPlaceRoot, "ruled.pdf");
+    var ruleResult = PdfInPlaceEdit.SetRuleThickness(inPlaceSource, ruled, 1, 1.0);
+    var ruleCheck = ruleResult.Done ? PdfInPlaceEdit.Verify(inPlaceSource, ruled, 1, ruleThickness: 1.0) : new PdfEditVerification(false, ["not done"]);
+    var unchangedRuleCheck = PdfInPlaceEdit.Verify(inPlaceSource, inPlaceSource, 1, ruleThickness: 1.0);
+    Check(replaceResult.Done && replaceCheck.Passed && !missingLetter.Done && missingLetter.Detail.Contains("「幕」", StringComparison.Ordinal) &&
+          !coverCheck.Passed && coverCheck.Problems.Any(problem => problem.Contains("still in", StringComparison.Ordinal)) &&
+          ruleResult.Done && ruleCheck.Passed && !unchangedRuleCheck.Passed &&
+          Math.Abs(PdfInPlaceEdit.RuleThicknesses(inPlaceSource, 1).Single() - 0.5) < 0.01 && Math.Abs(PdfInPlaceEdit.RuleThicknesses(ruled, 1, 1.5).Single() - 1.0) < 0.01,
+        "pdf-edits-in-place-are-verified-and-a-white-box-is-not-a-deletion:" + replaceResult.Detail + "/" + string.Join("|", replaceCheck.Problems) + "/" + missingLetter.Detail + "/" +
+        string.Join("|", coverCheck.Problems) + "/" + ruleResult.Detail + "/" + string.Join("|", ruleCheck.Problems));
+    // PdfLite, the C# 5 helper generated PDF editors get: the same edits from inside an app, saved as an incremental
+    // update after the original bytes, read back with PdfPig.
+    var lite = PdfLite.Open(inPlaceSource);
+    var liteText = lite.PageText(1);
+    var liteSame = lite.ReplaceText(1, "閉会", "開会", 1);
+    var liteMissing = lite.ReplaceText(1, "研修日程", "研修予定", 1);
+    var liteSubstitute = lite.ReplaceTextWithFont(1, "研修日程", "研修予定", 1, "gothic");
+    var liteRules = lite.Rules(1);
+    var liteRule = lite.SetRuleThickness(1, -1, 1.0);
+    var liteUndo = lite.Undo() && lite.History.Count == 2 && lite.Redo() && lite.History.Count == 3;
+    var liteSpaced = lite.ReplaceText(1, "摘要", "要摘", 1); // found without the space, saved with it
+    var liteRotated = lite.RotatePage(1, 90).Done && lite.PageRotation(1) == 90 && !lite.RotatePage(1, 45).Done;
+    var liteSaved = Path.Combine(inPlaceRoot, "lite-saved.pdf");
+    lite.Save(liteSaved);
+    var liteOverwrite = false;
+    try { lite.Save(inPlaceSource); } catch (IOException) { liteOverwrite = true; }
+    var liteOriginal = await File.ReadAllBytesAsync(inPlaceSource);
+    var liteBytes = await File.ReadAllBytesAsync(liteSaved);
+    string liteReadBack;
+    var liteFonts = new Dictionary<string, string>();
+    using (var check = UglyToad.PdfPig.PdfDocument.Open(liteSaved))
+    {
+        liteReadBack = string.Concat(check.GetPage(1).Text.Where(ch => !char.IsWhiteSpace(ch)));
+        foreach (var letter in check.GetPage(1).Letters) liteFonts[letter.Value] = letter.FontName ?? "";
+    }
+    // Only the letters that changed are in the Windows font; 「研修」, shared by both texts, keeps the embedded font.
+    var liteOnlyChanged = liteFonts.TryGetValue("研", out var keptFont) && liteFonts.TryGetValue("予", out var addedFont) &&
+                          !keptFont.Contains("MS-Gothic", StringComparison.Ordinal) && addedFont.Contains("MS-Gothic", StringComparison.Ordinal);
+    var liteVerify = PdfInPlaceEdit.Verify(inPlaceSource, liteSaved, 1, ruleThickness: 1.0);
+    var liteReopened = PdfLite.Open(liteSaved);
+    Check(liteText.Contains("開会挨拶と閉会", StringComparison.Ordinal) && liteSame.Done && !liteMissing.Done && liteMissing.MissingLetters == "予定" &&
+          liteSubstitute.Done && liteSubstitute.UsedSubstituteFont && liteOnlyChanged && liteRules.Count == 1 && Math.Abs(liteRules[0].Thickness - 0.5) < 0.01 && liteRule.Done && liteUndo && liteOverwrite &&
+          liteBytes.Length > liteOriginal.Length && liteBytes.AsSpan(0, liteOriginal.Length).SequenceEqual(liteOriginal) &&
+          liteReadBack.Contains("開会挨拶と開会", StringComparison.Ordinal) && liteReadBack.Contains("研修予定", StringComparison.Ordinal) && !liteReadBack.Contains("閉会", StringComparison.Ordinal) &&
+          liteVerify.Problems.All(problem => problem.Contains("text changed", StringComparison.Ordinal) || problem.Contains("overlap", StringComparison.Ordinal)) &&
+          !liteVerify.Problems.Any(problem => problem.Contains("rule", StringComparison.Ordinal)) &&
+          liteReopened.PageText(1).Contains("研修予定", StringComparison.Ordinal) && liteSpaced.Done && liteReopened.PageText(1).Contains("要　摘", StringComparison.Ordinal) && liteRotated && liteReopened.PageRotation(1) == 90 && Math.Abs(liteReopened.Rules(1)[0].Thickness - 1.0) < 0.01,
+        "pdflite-edits-text-and-rules-in-place-and-appends-to-the-original:" + liteSame.Message + "/" + liteMissing.Message + "/" + liteSubstitute.Message + "/" + liteRule.Message + "/" +
+        liteReadBack + "/" + string.Join("|", liteVerify.Problems) + "/" + string.Join(",", liteFonts.Where(pair => "研修予定".Contains(pair.Key, StringComparison.Ordinal)).Select(pair => pair.Key + "=" + pair.Value)));
+    var pdfApp = Path.Combine(inPlaceRoot, "pdf-app");
+    Directory.CreateDirectory(pdfApp);
+    await File.WriteAllTextAsync(Path.Combine(pdfApp, "Program.cs"), """
+        using System;
+        using System.Windows.Forms;
+        public class EditForm : Form
+        {
+            private Button open = new Button();
+            public EditForm()
+            {
+                open.Text = "開く";
+                open.Click += OnOpen;
+                Controls.Add(open);
+            }
+            private void OnOpen(object sender, EventArgs e)
+            {
+                var dialog = new OpenFileDialog();
+                if (dialog.ShowDialog() != DialogResult.OK) return;
+                var doc = PdfLite.Open(dialog.FileName);
+                var edit = doc.ReplaceText(1, "挨拶", "開会挨拶", 1);
+                if (!edit.Done && edit.MissingLetters.Length > 0) edit = doc.ReplaceTextWithFont(1, "挨拶", "開会挨拶", 1, "gothic");
+                doc.SetRuleThickness(1, -1, 1.0);
+                var save = new SaveFileDialog();
+                if (save.ShowDialog() == DialogResult.OK) doc.Save(save.FileName);
+                MessageBox.Show(edit.Message);
+            }
+            [STAThread]
+            static void Main() { Application.EnableVisualStyles(); Application.Run(new EditForm()); }
+        }
+        """);
+    await File.WriteAllTextAsync(Path.Combine(pdfApp, "app.manifest"), WindowsApplicationManifest.Content);
+    foreach (var helper in WindowsToolbox.Files(WindowsToolbox.For("PDFの文字を書き換えるアプリ")))
+        await File.WriteAllTextAsync(Path.Combine(pdfApp, helper.RelativePath), helper.Content);
+    string? pdfAppBuild = null;
+    try { await new WindowsExecutableCompiler().CompileAsync(pdfApp); }
+    catch (Exception ex) when (ex is InvalidDataException or WindowsBuildEnvironmentException) { pdfAppBuild = ex.Message; }
+    Check(pdfAppBuild is null && WindowsToolbox.For("PDFを編集").Any(tool => tool.FileName == "PdfLite.cs") &&
+          LocalWindowsAppGenerationEngine.ValidateSource(WindowsToolbox.AppSources(pdfApp)).Count == 0,
+        "generated-pdf-app-builds-with-pdflite-using-the-windows-compiler:" + pdfAppBuild);
+    // The catalogue's give-ups of 2026-10-20, each turned into a check or a standard fix.
+    var brokenExe = string.Join("\n",
+        "using System;", "using System.Collections.Generic;", "using System.Drawing;", "using System.Windows.Forms;",
+        "public class GameForm : Form",
+        "{",
+        "    private Label ball = new Label();",
+        "    private List<Rectangle> blocks = new List<Rectangle> { new Rectangle(0, 0, 10, 10) };",
+        "    public GameForm() { Controls.Add(ball); ball.Click += Move; }",
+        "    private void Move(object sender, EventArgs e)",
+        "    {",
+        "        ball.Location.X += 5;",
+        "        blocks[0].Y = 20;",
+        "        List<string> cells = new string[] { \"a\", \"b\" };",
+        "        string name = Microsoft.VisualBasic.Interaction.InputBox(\"名前\", \"入力\", \"\");",
+        "        Text = name + cells.Count;",
+        "    }",
+        "    [STAThread] static void Main() { Application.Run(new GameForm()); }",
+        "}");
+    var brokenApp = Path.Combine(inPlaceRoot, "compile-fix-app");
+    Directory.CreateDirectory(brokenApp);
+    await File.WriteAllTextAsync(Path.Combine(brokenApp, "app.manifest"), WindowsApplicationManifest.Content);
+    await File.WriteAllTextAsync(Path.Combine(brokenApp, "Program.cs"), brokenExe);
+    string? firstBuild = null, fixedBuild = null;
+    try { await new WindowsExecutableCompiler().CompileAsync(brokenApp); } catch (InvalidDataException ex) { firstBuild = ex.Message; }
+    var compileFixed = firstBuild is null ? null : CompileErrorFixes.Apply(brokenExe, firstBuild);
+    if (compileFixed is not null)
+    {
+        await File.WriteAllTextAsync(Path.Combine(brokenApp, "Program.cs"), LocalWindowsAppGenerationEngine.AddSafeFrameworkUsings(compileFixed));
+        try { await new WindowsExecutableCompiler().CompileAsync(brokenApp); } catch (InvalidDataException ex) { fixedBuild = ex.Message; }
+    }
+    Check(firstBuild is not null && firstBuild.Contains("CS0029", StringComparison.Ordinal) && !firstBuild.Contains("VisualBasic", StringComparison.Ordinal) &&
+          compileFixed is not null && compileFixed.Contains("var lsCopy = ball.Location; lsCopy.X += 5; ball.Location = lsCopy;", StringComparison.Ordinal) &&
+          compileFixed.Contains("var lsCopy = blocks[0]; lsCopy.Y = 20; blocks[0] = lsCopy;", StringComparison.Ordinal) &&
+          compileFixed.Contains("new string[] { \"a\", \"b\" }).ToList();", StringComparison.Ordinal) && fixedBuild is null,
+        "standard-compile-errors-are-fixed-and-visual-basic-input-box-builds:" + firstBuild?[..Math.Min(400, firstBuild.Length)] + "/" + fixedBuild);
+    var invoicePlan = new StudioBlueprint("請求書", "", "app", ["品名・数量・単価を入力する", "合計を計算する"], [], [], [], []);
+    var printless = "class F : Form { void Calc() { total.Text = (price * count).ToString(); } }";
+    var csvRequirement = new[] { new GeneratedRequirement("LS-REQ-002", "空白行と重複行を取り除く") };
+    var gasBrokenCandidate = new GasCandidate([new GasGeneratedFile("Code.gs", "function summarize() {\n  const sheet = SpreadsheetApp.getActiveSheet(;\n}\n")], [new GasRequirementEvidence("LS-REQ-001", "summarize")]);
+    var gasReadOnly = new GasCandidate([new GasGeneratedFile("Code.gs", "function summarize() {\n  const values = SpreadsheetApp.getActiveSheet().getDataRange().getValues();\n  Logger.log(values.length);\n}\n")], [new GasRequirementEvidence("LS-REQ-001", "summarize")]);
+    var gasSummary = new[] { new GeneratedRequirement("LS-REQ-001", "質問ごとの回答の件数を新しいシートに集計する") };
+    var gasNewline = LocalAppsScriptGenerationEngine.Normalize(new GasCandidate([new GasGeneratedFile("Code.gs", "function a() {\n  const text = rows.join('\n');\n  return text;\n}\n")], []), []);
+    var cleanerBody = "<button id=\"go\">整える</button><p id=\"out\"></p>";
+    var cleanerScript = "document.getElementById('go').addEventListener('click', () => { document.getElementById('out').textContent = 'ok'; });";
+    var cleanerPlan = new StudioBlueprint("CSV", "", "app", [], [], [], [], []);
+    Check(LocalWindowsAppGenerationEngine.ValidateRequirementGrounding(printless, invoicePlan, StudioProjectKind.WindowsApp, "請求書を入力して印刷できるアプリ").Any(error => error.StartsWith("requirement.mechanism-missing:print", StringComparison.Ordinal)) &&
+          !LocalWindowsAppGenerationEngine.ValidateRequirementGrounding(printless, invoicePlan, StudioProjectKind.WindowsApp).Any(error => error.Contains(":print", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["月ごとの合計を表示する"], "total += amount;").Count == 1 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["月ごとの合計を表示する"], "var key = date.ToString(\"yyyy/MM\");").Count == 0 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "出勤日をチェックで入力する")], "<input id=\"d\">", "").Count == 1 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "出勤日をチェックで入力する")], "<input type=\"checkbox\">", "").Count == 0 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "マウスでなぞって絵を描ける")], "", "ctx.fillRect(x, y, 1, 1);").Count == 1 &&
+          LocalWebAppGenerationEngine.RequirementsWithoutMechanism([new GeneratedRequirement("LS-REQ-001", "結果をファイルに保存できる")], "", "a.download = 'x.csv'; new Blob([t]);").Count == 0 &&
+          LocalAppsScriptGenerationEngine.Validate(gasBrokenCandidate, [new GeneratedRequirement("LS-REQ-001", "集計する")]).Any(error => error.StartsWith("gas.syntax:Code.gs", StringComparison.Ordinal)) &&
+          LocalAppsScriptGenerationEngine.Validate(gasReadOnly, gasSummary).Any(error => error.StartsWith("requirement.mechanism-missing:sheet-write", StringComparison.Ordinal)) &&
+          gasNewline.Fixes > 0 && GasStaticVerifier.SyntaxError(gasNewline.Candidate.Files[0].Content) is null &&
+          LocalWebAppGenerationEngine.ValidateCandidate(new GeneratedWebAppCandidate(cleanerBody, cleanerScript), cleanerPlan, csvRequirement).Any(error => error.StartsWith("requirement.not-visible:LS-REQ-002", StringComparison.Ordinal)) &&
+          !LocalWebAppGenerationEngine.ValidateCandidate(new GeneratedWebAppCandidate(cleanerBody, cleanerScript), cleanerPlan, csvRequirement,
+              acceptance: [new AcceptanceScenario("LS-REQ-002", "空白行", [new AcceptanceStep(Press: "整える")], ["ok"])]).Any(error => error.StartsWith("requirement.not-visible", StringComparison.Ordinal)),
+        "request-words-are-checked-and-give-ups-get-standard-fixes");
+    // Second re-measure (2026-10-20 evening): a helper carrying a raw U+FFFD made every PDF EXE unsaveable; matched memory
+    // cards were taken for a dead button; a GAS shift table without tick boxes and with "C2,D2" ranges got through.
+    var memoryCards = "class F : Form { Button start = new Button(); F() { Controls.Add(start); } void Card_Click(object sender, EventArgs e) { Button button = sender as Button; foreach (Button other in cards) { if (other.Tag == button.Tag) { other.Enabled = false; button.Enabled = false; } } } }";
+    var gasShift = new GasCandidate([new GasGeneratedFile("Code.gs", "function count() {\n  var sheet = SpreadsheetApp.getActiveSheet();\n  for (var i = 0; i < 5; i++) sheet.getRange('C' + (i + 2) + ',D' + (i + 2)).setValues([[1, 2]]);\n}\n")], [new GasRequirementEvidence("LS-REQ-001", "count")]);
+    var gasShiftErrors = LocalAppsScriptGenerationEngine.Validate(gasShift, [new GeneratedRequirement("LS-REQ-001", "出勤人数を集計する")], sourceRequest: "スタッフ名と出勤日をチェックで入力すると集計するシフト表");
+    Check(WindowsToolbox.All.All(tool => !WindowsToolbox.Source(tool).Contains('�') && !LocalWebAppGenerationEngine.HasForbiddenControlCharacters(WindowsToolbox.Source(tool))) &&
+          !LocalWindowsAppGenerationEngine.FalseSuccessShapes(memoryCards).Any(found => found.StartsWith("exe.never-enabled", StringComparison.Ordinal)) &&
+          gasShiftErrors.Any(error => error.StartsWith("gas.range-address", StringComparison.Ordinal)) && gasShiftErrors.Any(error => error.StartsWith("requirement.mechanism-missing:checkbox", StringComparison.Ordinal)) &&
+          !LocalWebAppGenerationEngine.ValidateCandidate(new GeneratedWebAppCandidate(cleanerBody, cleanerScript), cleanerPlan,
+              [.. csvRequirement, new GeneratedRequirement("LS-REQ-003", "前後の空白を消去する")],
+              acceptance: [new AcceptanceScenario("LS-REQ-002,LS-REQ-003", "整える", [new AcceptanceStep(Press: "整える")], ["ok"])]).Any(error => error.StartsWith("requirement.not-visible", StringComparison.Ordinal)),
+        "helpers-are-clean-per-item-disabling-is-fine-gas-ranges-and-request-words-are-checked:" + string.Join("|", gasShiftErrors));
+    // Hands-on 2026-10-21: the daily report and the renamer the user tried, in the shapes they had, and usable versions.
+    var unlabeledReport = "class F : Form { TextBox dateBox, doneBox, nextBox; DateTimePicker picker; Button save;\n F() {\n dateBox = new TextBox(); doneBox = new TextBox(); nextBox = new TextBox(); picker = new DateTimePicker();\n save = new Button(); save.Text = \"保存\";\n Controls.Add(dateBox); Controls.Add(doneBox); Controls.Add(nextBox); Controls.Add(picker); Controls.Add(save); } }";
+    var labeledReport = "class F : Form { TextBox doneBox; DateTimePicker picker; Button save;\n F() {\n var dateLabel = new Label(); dateLabel.Text = \"日付\"; dateLabel.Location = new Point(0, 0); var doneLabel = new Label(); doneLabel.Text = \"やったこと\"; doneLabel.Location = new Point(0, 30);\n doneBox = new TextBox(); picker = new DateTimePicker(); save = new Button(); save.Text = \"保存\";\n Controls.Add(dateLabel); Controls.Add(picker); Controls.Add(doneLabel); Controls.Add(doneBox); Controls.Add(save); } void Save_Click(object s, EventArgs e) { var line = picker.Value.ToString() + doneBox.Text; File.WriteAllText(path, line); } }";
+    var randomRenamer = "class F : Form { Button pick, rename; ListBox list; List<string> olds = new List<string>(); List<string> news = new List<string>();\n F() {\n pick = new Button(); pick.Text = \"フォルダーを選択\"; rename = new Button(); rename.Text = \"ファイル名を変更\";\n list = new ListBox(); Controls.Add(pick); Controls.Add(rename); Controls.Add(list); }\n" +
+                         " void Pick_Click(object s, EventArgs e) { foreach (string f in Directory.GetFiles(folder)) { string n = DateTime.Now.ToString(\"yyyyMMdd_\") + Path.GetRandomFileName(); olds.Add(f); news.Add(n); list.Items.Add(string.Format(\"Original: {0}, New: {1}\", f, n)); } }\n" +
+                         " void Rename_Click(object s, EventArgs e) { for (int i = 0; i < olds.Count; i++) File.Move(olds[i], news[i]); MessageBox.Show(\"完了しました\"); } }";
+    var usableRenamer = "class F : Form { Button pick, rename; ListBox list; TextBox prefix; Label prefixLabel; List<string> olds = new List<string>(); List<string> news = new List<string>();\n F() {\n prefixLabel = new Label(); prefixLabel.Text = \"先頭に付ける文字\"; prefixLabel.Location = new Point(0, 0); prefix = new TextBox();\n pick = new Button(); pick.Text = \"フォルダーを選択\"; pick.AutoSize = true; rename = new Button(); rename.Text = \"名前を変える\"; rename.Width = 120;\n list = new ListBox(); Controls.Add(prefixLabel); Controls.Add(prefix); Controls.Add(pick); Controls.Add(rename); Controls.Add(list); }\n" +
+                          " void Pick_Click(object s, EventArgs e) { int n = 1; foreach (string f in Directory.GetFiles(folder)) { string name = prefix.Text + n.ToString(\"D3\") + \"_\" + Path.GetFileName(f); n++; olds.Add(f); news.Add(name); list.Items.Add(Path.GetFileName(f) + \" → \" + name); } }\n" +
+                          " void Rename_Click(object s, EventArgs e) { foreach (string target in news) if (File.Exists(target)) return; var moved = new List<int>(); try { for (int i = 0; i < olds.Count; i++) { File.Move(olds[i], news[i]); moved.Add(i); } } catch { for (int j = moved.Count - 1; j >= 0; j--) File.Move(news[moved[j]], olds[moved[j]]); throw; } olds.Clear(); news.Clear(); rename.Enabled = false; MessageBox.Show(\"名前を変えました\"); } }";
+    var guardApp = Path.Combine(inPlaceRoot, "error-message-app");
+    Directory.CreateDirectory(guardApp);
+    await File.WriteAllTextAsync(Path.Combine(guardApp, "app.manifest"), WindowsApplicationManifest.Content);
+    await File.WriteAllTextAsync(Path.Combine(guardApp, "Program.cs"), WindowsSourceAutoFix.Apply("using System;\nusing System.Windows.Forms;\nclass F : Form\n{\n    [STAThread]\n    static void Main()\n    {\n        Application.Run(new F());\n    }\n}\n").Source);
+    string? guardBuild = null;
+    try { await new WindowsExecutableCompiler().CompileAsync(guardApp); } catch (InvalidDataException ex) { guardBuild = ex.Message; }
+    var reportFindings = LocalWindowsAppGenerationEngine.UsabilityShapes(unlabeledReport);
+    var renamerFindings = LocalWindowsAppGenerationEngine.UsabilityShapes(randomRenamer);
+    var guardedMain = WindowsSourceAutoFix.Apply("using System;\nusing System.Windows.Forms;\nclass F : Form\n{\n    [STAThread]\n    static void Main()\n    {\n        Application.Run(new F());\n    }\n}\n").Source;
+    Check(reportFindings.Any(found => found.StartsWith("exe.unlabeled-inputs", StringComparison.Ordinal)) && LocalWindowsAppGenerationEngine.UsabilityShapes(labeledReport).Count == 0 &&
+          renamerFindings.Any(found => found.StartsWith("exe.button-text-cut:pick", StringComparison.Ordinal)) && renamerFindings.Any(found => found.StartsWith("exe.english-ui", StringComparison.Ordinal)) &&
+          renamerFindings.Any(found => found.StartsWith("exe.random-names", StringComparison.Ordinal)) && renamerFindings.Any(found => found.StartsWith("exe.repeat-apply:Rename_Click", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.UsabilityShapes(usableRenamer).Count == 0 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["ファイル名の先頭に連番を付けて一括で名前を変える"], randomRenamer).Any(found => found.Contains(":rename-rule", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["ファイル名の先頭に連番を付けて一括で名前を変える"], usableRenamer).Count == 0 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["結果を名前を付けて保存する"], "var d = new SaveFileDialog(); File.WriteAllText(d.FileName, text);").Count == 0 &&
+          guardedMain.IndexOf("ThreadException", StringComparison.Ordinal) is > 0 and var guardAt && guardAt < guardedMain.IndexOf("Application.Run", StringComparison.Ordinal) &&
+          WindowsSourceAutoFix.Apply(guardedMain).Source == guardedMain && guardBuild is null,
+        "unusable-exe-shapes-from-hands-on-are-refused-and-usable-versions-pass:" + string.Join(" | ", reportFindings.Concat(renamerFindings).Select(found => found.Split(':')[0])) + " / usable: " + string.Join("|", LocalWindowsAppGenerationEngine.UsabilityShapes(usableRenamer).Concat(LocalWindowsAppGenerationEngine.UsabilityShapes(labeledReport))));
+    // Regeneration 2026-10-26: the renamer that passed gave every file "prefix_now.ext" and its preview read the new
+    // names before the rename had made them.
+    var sameNameRenamer = "class F : Form { List<string> originalNames = new List<string>(); List<string> newNames = new List<string>();\n" +
+                          " void Pick_Click(object s, EventArgs e) { foreach (string file in Directory.GetFiles(folder)) originalNames.Add(Path.GetFileName(file)); }\n" +
+                          " void Rename_Click(object s, EventArgs e) { string folderPath = dialog.SelectedPath; for (int i = 0; i < list.Items.Count; i++) { string oldName = originalNames[i];\n" +
+                          "  string newName = box.Text + \"_\" + DateTime.Now.ToString(\"yyyyMMdd_HHmmss\") + Path.GetExtension(oldName); string oldFilePath = Path.Combine(folderPath, oldName); string newFilePath = Path.Combine(folderPath, newName);\n" +
+                          "  File.Move(oldFilePath, newFilePath); newNames.Add(newName); } button.Enabled = false; }\n" +
+                          " void View_Click(object s, EventArgs e) { list.Items.Clear(); for (int i = 0; i < originalNames.Count; i++) { list.Items.Add(originalNames[i] + \" → \" + newNames[i]); } button.Enabled = true; } }";
+    var sameNameFindings = LocalWindowsAppGenerationEngine.UsabilityShapes(sameNameRenamer);
+    var numberedRenamer = sameNameRenamer.Replace("box.Text + \"_\" + DateTime", "box.Text + (i + 1).ToString(\"000\") + \"_\" + DateTime")
+        .Replace("for (int i = 0; i < originalNames.Count; i++) { list.Items.Add(originalNames[i] + \" → \" + newNames[i]); }", "foreach (string name in originalNames) list.Items.Add(name);");
+    Check(sameNameFindings.Any(found => found.StartsWith("exe.same-new-name", StringComparison.Ordinal)) &&
+          sameNameFindings.Any(found => found.StartsWith("exe.read-before-filled:View_Click", StringComparison.Ordinal)) &&
+          !LocalWindowsAppGenerationEngine.UsabilityShapes(numberedRenamer).Any(found => found.StartsWith("exe.same-new-name", StringComparison.Ordinal) || found.StartsWith("exe.read-before-filled", StringComparison.Ordinal)) &&
+          !LocalWindowsAppGenerationEngine.UsabilityShapes(usableRenamer).Any(found => found.StartsWith("exe.same-new-name", StringComparison.Ordinal)) &&
+          !LocalWindowsAppGenerationEngine.UsabilityShapes("class F { void Sort_Click(object s, EventArgs e) { foreach (var file in Directory.GetFiles(folder)) { var target = Path.Combine(folder, Path.GetExtension(file).TrimStart('.'), Path.GetFileName(file)); File.Move(file, target); } } }").Any(found => found.StartsWith("exe.same-new-name", StringComparison.Ordinal)),
+        "renames-to-one-name-and-previews-of-unfilled-lists-are-refused:" + string.Join(" | ", sameNameFindings.Select(found => found.Split(':')[0])) + " / numbered: " + string.Join("|", LocalWindowsAppGenerationEngine.UsabilityShapes(numberedRenamer)));
+    // Run 19 (2026-10-27): the model satisfied the old checks by placing two labels at (0,0), ignored the starting-number
+    // control, and used a details ListView without columns. Its Excel app copied separate sheets and created an empty
+    // summary while discarding CombineSheets warnings.
+    var disconnectedRenamer = "class F : Form { NumericUpDown start; TextBox prefix; Label a, b; ListView preview; F() { a = new Label(); b = new Label(); Controls.Add(a); Controls.Add(b); start = new NumericUpDown(); start.Value = 1; prefix = new TextBox(); preview = new ListView(); preview.View = View.Details; Controls.Add(start); Controls.Add(prefix); Controls.Add(preview); } string Name(int i) { return prefix.Text + (i + 1).ToString(); } }";
+    var disconnectedFindings = LocalWindowsAppGenerationEngine.UsabilityShapes(disconnectedRenamer);
+    var falseExcelMerge = "var files = Directory.GetFiles(folder, \"*.xlsx\"); var notes = new List<string>(); XlsxLite.CombineSheets(output, pairs, \"まとめ\", new List<string[]>()); if (notes.Count == 0) status.Text = \"完了\";";
+    var falseExcelFindings = LocalWindowsAppGenerationEngine.FalseSuccessShapes(falseExcelMerge);
+    var rowAggregateRequest = new[] { "学校名の列を付けて回答を1つの表に統合する" };
+    var duplicateDateInputs = "class F : Form { TextBox dateTextBox; DateTimePicker datePicker; F() { dateTextBox = new TextBox(); datePicker = new DateTimePicker(); Controls.Add(dateTextBox); Controls.Add(datePicker); var a = dateTextBox.Text; var b = datePicker.Value; } }";
+    var distinctDateInputs = "class F : Form { DateTimePicker startDatePicker; DateTimePicker endDatePicker; F() { startDatePicker = new DateTimePicker(); endDatePicker = new DateTimePicker(); Controls.Add(startDatePicker); Controls.Add(endDatePicker); var a = startDatePicker.Value; var b = endDatePicker.Value; } }";
+    var duplicateDateFindings = LocalWindowsAppGenerationEngine.UsabilityShapes(duplicateDateInputs);
+    var duplicateDateWithEmptyLayout = """
+        class F : Form
+        {
+            private TextBox dateTextBox;
+            private DateTimePicker datePicker;
+            private FlowLayoutPanel obsoleteDateRow;
+            F()
+            {
+                dateTextBox = new TextBox();
+                obsoleteDateRow = new FlowLayoutPanel();
+                obsoleteDateRow.Dock = DockStyle.Top;
+                obsoleteDateRow.Controls.Add(dateTextBox);
+                Controls.Add(obsoleteDateRow);
+                datePicker = new DateTimePicker();
+                Controls.Add(datePicker);
+                var savedDate = datePicker.Value;
+            }
+        }
+        """;
+    var repairedDuplicateDate = LocalWindowsAppGenerationEngine.RemoveUnusedDuplicateInputControls(duplicateDateWithEmptyLayout);
+    var promotionSource = Path.Combine(smokeRoot, "promotion-source");
+    var promotionDestination = Path.Combine(smokeRoot, "promotion-destination");
+    Directory.CreateDirectory(promotionSource);
+    await File.WriteAllTextAsync(Path.Combine(promotionSource, "evidence.txt"), "verified");
+    var promotionAttempts = 0;
+    await DirectoryPromotion.MoveWithTransientRetryAsync(
+        promotionSource,
+        promotionDestination,
+        CancellationToken.None,
+        (source, destination) =>
+        {
+            promotionAttempts++;
+            if (promotionAttempts < 3) throw new UnauthorizedAccessException("simulated transient scanner lock");
+            Directory.Move(source, destination);
+        },
+        retryDelay: _ => TimeSpan.Zero);
+    Check(disconnectedFindings.Count(found => found.StartsWith("exe.label-default-position", StringComparison.Ordinal)) == 2 &&
+          disconnectedFindings.Any(found => found.StartsWith("exe.input-value-unused:start", StringComparison.Ordinal)) &&
+          disconnectedFindings.Any(found => found.StartsWith("exe.details-without-columns:preview", StringComparison.Ordinal)) &&
+          duplicateDateFindings.Any(found => found.StartsWith("exe.duplicate-input-concept:date", StringComparison.Ordinal)) &&
+          !LocalWindowsAppGenerationEngine.UsabilityShapes(distinctDateInputs).Any(found => found.StartsWith("exe.duplicate-input-concept", StringComparison.Ordinal)) &&
+          !repairedDuplicateDate.Contains("dateTextBox", StringComparison.Ordinal) && repairedDuplicateDate.Contains("datePicker", StringComparison.Ordinal) &&
+          !repairedDuplicateDate.Contains("obsoleteDateRow", StringComparison.Ordinal) &&
+          !LocalWindowsAppGenerationEngine.UsabilityShapes(repairedDuplicateDate).Any(found => found.StartsWith("exe.duplicate-input-concept", StringComparison.Ordinal) || found.StartsWith("exe.input-value-unused:dateTextBox", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RemoveUnusedDuplicateInputControls(duplicateDateInputs) == duplicateDateInputs &&
+          promotionAttempts == 3 && File.ReadAllText(Path.Combine(promotionDestination, "evidence.txt")) == "verified" && !Directory.Exists(promotionSource) &&
+          falseExcelFindings.Any(found => found.StartsWith("excel.combine-result-ignored", StringComparison.Ordinal)) &&
+          falseExcelFindings.Any(found => found.StartsWith("excel.empty-summary", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(rowAggregateRequest, falseExcelMerge).Any(found => found.Contains(":excel-row-aggregation", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(rowAggregateRequest, "var rows = new List<string[]>(); foreach (var file in files) { foreach (var row in XlsxLite.ReadSheet(file)) rows.Add(row); } XlsxLite.WriteSheet(output, rows);").Count == 0 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["ファイル名を連番付きに変える"], "File.Move(oldPath, newPath);").Any(found => found.Contains(":rename-safety", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["ファイル名を連番付きに変える"], usableRenamer).Count == 0,
+        "run19-formal-passes-are-refused:" + string.Join(" | ", disconnectedFindings.Concat(falseExcelFindings).Select(found => found.Split(':')[0])));
+    // Hands-on 2026-10-21: an Excel merge lost the forms' look. CombineSheets keeps each school's sheet as it was, from
+    // workbooks whose formats differ, and puts a values sheet first.
+    void MakeForm(string file, string school, double titleSize, bool reversed)
+    {
+        using var document = DocumentFormat.OpenXml.Packaging.SpreadsheetDocument.Create(file, DocumentFormat.OpenXml.SpreadsheetDocumentType.Workbook);
+        var book = document.AddWorkbookPart();
+        book.Workbook = new DocumentFormat.OpenXml.Spreadsheet.Workbook();
+        var stylePart = book.AddNewPart<DocumentFormat.OpenXml.Packaging.WorkbookStylesPart>();
+        var plainFont = new DocumentFormat.OpenXml.Spreadsheet.Font(new DocumentFormat.OpenXml.Spreadsheet.FontSize { Val = 11 });
+        var titleFont = new DocumentFormat.OpenXml.Spreadsheet.Font(new DocumentFormat.OpenXml.Spreadsheet.Bold(), new DocumentFormat.OpenXml.Spreadsheet.FontSize { Val = titleSize });
+        var dateCode = reversed ? "ggge\"年\"m\"月\"d\"日\"" : "yyyy\"年\"m\"月\"d\"日\"";
+        stylePart.Stylesheet = new DocumentFormat.OpenXml.Spreadsheet.Stylesheet(
+            new DocumentFormat.OpenXml.Spreadsheet.NumberingFormats(new DocumentFormat.OpenXml.Spreadsheet.NumberingFormat { NumberFormatId = 164, FormatCode = dateCode }) { Count = 1 },
+            new DocumentFormat.OpenXml.Spreadsheet.Fonts(reversed ? new[] { titleFont, plainFont } : new[] { plainFont, titleFont }) { Count = 2 },
+            new DocumentFormat.OpenXml.Spreadsheet.Fills(
+                new DocumentFormat.OpenXml.Spreadsheet.Fill(new DocumentFormat.OpenXml.Spreadsheet.PatternFill { PatternType = DocumentFormat.OpenXml.Spreadsheet.PatternValues.None }),
+                new DocumentFormat.OpenXml.Spreadsheet.Fill(new DocumentFormat.OpenXml.Spreadsheet.PatternFill { PatternType = DocumentFormat.OpenXml.Spreadsheet.PatternValues.Gray125 }),
+                new DocumentFormat.OpenXml.Spreadsheet.Fill(new DocumentFormat.OpenXml.Spreadsheet.PatternFill(new DocumentFormat.OpenXml.Spreadsheet.ForegroundColor { Rgb = "FFFFFF00" }) { PatternType = DocumentFormat.OpenXml.Spreadsheet.PatternValues.Solid })) { Count = 3 },
+            new DocumentFormat.OpenXml.Spreadsheet.Borders(new DocumentFormat.OpenXml.Spreadsheet.Border(),
+                new DocumentFormat.OpenXml.Spreadsheet.Border(new DocumentFormat.OpenXml.Spreadsheet.LeftBorder { Style = DocumentFormat.OpenXml.Spreadsheet.BorderStyleValues.Thin },
+                    new DocumentFormat.OpenXml.Spreadsheet.RightBorder { Style = DocumentFormat.OpenXml.Spreadsheet.BorderStyleValues.Thin }, new DocumentFormat.OpenXml.Spreadsheet.TopBorder { Style = DocumentFormat.OpenXml.Spreadsheet.BorderStyleValues.Thin },
+                    new DocumentFormat.OpenXml.Spreadsheet.BottomBorder { Style = DocumentFormat.OpenXml.Spreadsheet.BorderStyleValues.Thin }, new DocumentFormat.OpenXml.Spreadsheet.DiagonalBorder())) { Count = 2 },
+            new DocumentFormat.OpenXml.Spreadsheet.CellStyleFormats(new DocumentFormat.OpenXml.Spreadsheet.CellFormat()) { Count = 1 },
+            new DocumentFormat.OpenXml.Spreadsheet.CellFormats(new DocumentFormat.OpenXml.Spreadsheet.CellFormat(),
+                new DocumentFormat.OpenXml.Spreadsheet.CellFormat { FontId = reversed ? 0u : 1u, FillId = 2, BorderId = 1, ApplyFont = true, ApplyFill = true, ApplyBorder = true },
+                new DocumentFormat.OpenXml.Spreadsheet.CellFormat { NumberFormatId = 164, FontId = reversed ? 1u : 0u, ApplyNumberFormat = true }) { Count = 3 });
+        var strings = book.AddNewPart<DocumentFormat.OpenXml.Packaging.SharedStringTablePart>();
+        strings.SharedStringTable = new DocumentFormat.OpenXml.Spreadsheet.SharedStringTable(
+            new DocumentFormat.OpenXml.Spreadsheet.SharedStringItem(new DocumentFormat.OpenXml.Spreadsheet.Text(school)),
+            new DocumentFormat.OpenXml.Spreadsheet.SharedStringItem(new DocumentFormat.OpenXml.Spreadsheet.Text("使用する")));
+        var sheetPart = book.AddNewPart<DocumentFormat.OpenXml.Packaging.WorksheetPart>();
+        sheetPart.Worksheet = new DocumentFormat.OpenXml.Spreadsheet.Worksheet(
+            new DocumentFormat.OpenXml.Spreadsheet.Columns(new DocumentFormat.OpenXml.Spreadsheet.Column { Min = 1, Max = 1, Width = 30, CustomWidth = true }),
+            new DocumentFormat.OpenXml.Spreadsheet.SheetData(
+                new DocumentFormat.OpenXml.Spreadsheet.Row(new DocumentFormat.OpenXml.Spreadsheet.Cell { CellReference = "A1", DataType = DocumentFormat.OpenXml.Spreadsheet.CellValues.SharedString, CellValue = new DocumentFormat.OpenXml.Spreadsheet.CellValue("0"), StyleIndex = 1 }) { RowIndex = 1 },
+                new DocumentFormat.OpenXml.Spreadsheet.Row(new DocumentFormat.OpenXml.Spreadsheet.Cell { CellReference = "A2", CellValue = new DocumentFormat.OpenXml.Spreadsheet.CellValue("46000"), StyleIndex = 2 },
+                    new DocumentFormat.OpenXml.Spreadsheet.Cell { CellReference = "B2", DataType = DocumentFormat.OpenXml.Spreadsheet.CellValues.SharedString, CellValue = new DocumentFormat.OpenXml.Spreadsheet.CellValue("1") }) { RowIndex = 2 }),
+            new DocumentFormat.OpenXml.Spreadsheet.MergeCells(new DocumentFormat.OpenXml.Spreadsheet.MergeCell { Reference = "A1:B1" }) { Count = 1 });
+        book.Workbook.AppendChild(new DocumentFormat.OpenXml.Spreadsheet.Sheets(new DocumentFormat.OpenXml.Spreadsheet.Sheet { Id = book.GetIdOfPart(sheetPart), SheetId = 1, Name = "回答" }));
+    }
+    var formFolder = Path.Combine(inPlaceRoot, "forms");
+    Directory.CreateDirectory(formFolder);
+    var firstForm = Path.Combine(formFolder, "第一小.xlsx");
+    var secondForm = Path.Combine(formFolder, "第二小.xlsx");
+    MakeForm(firstForm, "第一小学校", 14, false);
+    MakeForm(secondForm, "第二小学校", 16, true);
+    var combined = Path.Combine(formFolder, "まとめ.xlsx");
+    var combineNotes = XlsxLite.CombineSheets(combined, new List<KeyValuePair<string, string>> { new("第一小", firstForm), new("第二小", secondForm) }, "一覧", [["学校名", "回答"], ["第一小", "使用する"], ["第二小", "使用する"]]);
+    var combineChecks = new List<string>();
+    using (var result = DocumentFormat.OpenXml.Packaging.SpreadsheetDocument.Open(combined, false))
+    {
+        var validation = new DocumentFormat.OpenXml.Validation.OpenXmlValidator().Validate(result).Take(3).Select(error => error.Description).ToList();
+        if (validation.Count > 0) combineChecks.Add("invalid: " + string.Join(" / ", validation));
+        var bookPart = result.WorkbookPart!;
+        var sheetNames = bookPart.Workbook!.Sheets!.Elements<DocumentFormat.OpenXml.Spreadsheet.Sheet>().Select(sheet => sheet.Name!.Value).ToList();
+        if (!sheetNames.SequenceEqual(["一覧", "第一小", "第二小"])) combineChecks.Add("sheets " + string.Join(",", sheetNames));
+        var formats = bookPart.WorkbookStylesPart!.Stylesheet!;
+        foreach (var (sheetName, school, size, dateCode) in new[] { ("第一小", "第一小学校", 14.0, "yyyy\"年\"m\"月\"d\"日\""), ("第二小", "第二小学校", 16.0, "ggge\"年\"m\"月\"d\"日\"") })
+        {
+            var sheetRef = bookPart.Workbook!.Sheets!.Elements<DocumentFormat.OpenXml.Spreadsheet.Sheet>().First(sheet => sheet.Name == sheetName);
+            var worksheet = ((DocumentFormat.OpenXml.Packaging.WorksheetPart)bookPart.GetPartById(sheetRef.Id!)).Worksheet!;
+            var cells = worksheet.Descendants<DocumentFormat.OpenXml.Spreadsheet.Cell>().ToDictionary(cell => cell.CellReference!.Value!);
+            var title = (DocumentFormat.OpenXml.Spreadsheet.CellFormat)formats.CellFormats!.ElementAt((int)cells["A1"].StyleIndex!.Value);
+            var titleFontFound = (DocumentFormat.OpenXml.Spreadsheet.Font)formats.Fonts!.ElementAt((int)title.FontId!.Value);
+            var titleFill = (DocumentFormat.OpenXml.Spreadsheet.Fill)formats.Fills!.ElementAt((int)title.FillId!.Value);
+            var dateFormat = (DocumentFormat.OpenXml.Spreadsheet.CellFormat)formats.CellFormats!.ElementAt((int)cells["A2"].StyleIndex!.Value);
+            var code = formats.NumberingFormats!.Elements<DocumentFormat.OpenXml.Spreadsheet.NumberingFormat>().FirstOrDefault(format => format.NumberFormatId!.Value == dateFormat.NumberFormatId!.Value)?.FormatCode?.Value;
+            if (cells["A1"].InnerText != school) combineChecks.Add(sheetName + " text " + cells["A1"].InnerText);
+            if (titleFontFound.Bold is null || titleFontFound.FontSize?.Val?.Value != size) combineChecks.Add(sheetName + " font");
+            if (titleFill.PatternFill?.ForegroundColor?.Rgb?.Value != "FFFFFF00") combineChecks.Add(sheetName + " fill");
+            if (code != dateCode) combineChecks.Add(sheetName + " date " + code);
+            if (worksheet.Descendants<DocumentFormat.OpenXml.Spreadsheet.MergeCell>().SingleOrDefault()?.Reference?.Value != "A1:B1") combineChecks.Add(sheetName + " merge");
+            if (worksheet.Descendants<DocumentFormat.OpenXml.Spreadsheet.Column>().SingleOrDefault()?.Width?.Value != 30) combineChecks.Add(sheetName + " width");
+        }
+    }
+    // The plain list of paths a small model could write (2026-10-26): sheets are named after the files.
+    var byPaths = Path.Combine(formFolder, "まとめ2.xlsx");
+    var byPathsNotes = XlsxLite.CombineSheets(byPaths, new List<string> { firstForm, secondForm });
+    if (byPathsNotes.Count > 0 || !XlsxLite.SheetNames(byPaths).SequenceEqual(["第一小", "第二小"])) combineChecks.Add("by paths " + string.Join(",", XlsxLite.SheetNames(byPaths)));
+    Check(combineNotes.Count == 0 && combineChecks.Count == 0 && XlsxLite.ReadSheet(combined, "第二小")[1][1] == "使用する",
+        "excel-forms-are-combined-with-their-look-kept:" + string.Join(" | ", combineChecks.Concat(combineNotes)));
+    var countsDays = await JudgeHabitAsync("habit-days", "if (!h.days.includes(today())) h.days.push(today());", "h.name + ' 連続' + streak(h.days) + '日'");
+    var countsChecks = await JudgeHabitAsync("habit-checks", "h.done = !h.done;", "h.name + ' 連続' + (h.done ? 1 : 0) + '日'");
+    Check(countsDays.Verdict == CatalogVerdict.Verified && countsChecks.Verdict == CatalogVerdict.Wrong &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "const update = () => {\n const fromUnit = lengthUnit.value;\n const toUnit = lengthUnit.value;\n};").SingleOrDefault()?.StartsWith("behavior.same-field-twice:lengthUnit", StringComparison.Ordinal) == true,
+        "next-day-streaks-and-same-field-through-a-variable:" + countsDays.Verdict + "/" + string.Join("|", countsDays.Misses) + "/" + countsChecks.Verdict);
     var verificationStatusStore = new ProjectVerificationStatusStore(smokePaths);
     var pendingVerification = verificationStatusStore.Load(generatedProject);
     Check(pendingVerification.Applicable && pendingVerification.Level == "pending" && pendingVerification.Features.Count == 1 && !string.IsNullOrWhiteSpace(pendingVerification.Features[0].Instruction), "generated-app-manual-verification-starts-pending");
@@ -3312,10 +4221,120 @@ try
         "class UsesSafeCollection { private List<int> values = new List<int>(); }");
     Check(repairedFrameworkUsings.StartsWith("using System.Collections.Generic;", StringComparison.Ordinal), "windows-safe-framework-using-is-repaired-deterministically");
     Check(LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence("```csharp\nclass App { }\n```") == "class App { }", "windows-whole-source-fence-is-unwrapped");
-    Check(LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence("explanation\n```csharp\nclass App { }\n```").StartsWith("explanation", StringComparison.Ordinal), "windows-mixed-explanation-is-not-silently-accepted");
+    // Since 2026-10-19 the program is taken out of an explained reply (it still has to compile and pass the behaviour
+    // check); text without any fenced class is left as it is, for the source check to refuse.
+    Check(LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence("explanation\n```csharp\nclass App { }\n```") == "class App { }" &&
+          LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence("explanation\n```\nrun csc\n```").StartsWith("explanation", StringComparison.Ordinal),
+        "windows-program-is-taken-out-of-an-explained-reply-only-when-a-class-is-fenced");
     Check(LocalWindowsAppGenerationEngine.ValidateSource("var text = $\"score {score}\";").Contains("source.csharp5-compatibility"), "windows-csharp5-interpolation-is-rejected-before-compile");
     Check(!LocalWindowsAppGenerationEngine.ValidateSource(new string('a', 15_000)).Contains("source.missing-or-too-large"), "windows-source-bound-allows-bounded-complex-app");
     Check(LocalWindowsAppGenerationEngine.ValidateSource(new string('a', 16_001)).Contains("source.missing-or-too-large"), "windows-source-bound-remains-enforced");
+    var pickedFiles = "var dialog = new FolderBrowserDialog(); foreach (var f in Directory.GetFiles(dialog.SelectedPath)) File.Move(f, f + \".bak\");";
+    Check(!LocalWindowsAppGenerationEngine.ValidateSource(pickedFiles).Contains("security.user-storage-only") &&
+          LocalWindowsAppGenerationEngine.ValidateSource("var p = \"x\"; File.ReadAllText(p);").Contains("security.user-storage-only") &&
+          LocalWindowsAppGenerationEngine.ValidateSource(pickedFiles + " File.Delete(f);").Contains("security.no-delete") &&
+          LocalWindowsAppGenerationEngine.ValidateSource(pickedFiles + " new DirectoryInfo(d).Delete(true);").Contains("security.no-delete"),
+        "windows-apps-use-user-picked-files-but-never-delete");
+    Check(!LocalWindowsAppGenerationEngine.ValidateSource("void ProcessFiles(string folder) { } // processed").Any(error => error.StartsWith("security.forbidden-api", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.ValidateSource("System.Diagnostics.Process.Start(\"notepad\");").Contains("security.forbidden-api:Process.Start") &&
+          LocalWindowsAppGenerationEngine.ValidateSource("var u = \"https://example.com\";").Any(error => error.StartsWith("security.forbidden-api:https://", StringComparison.Ordinal)),
+        "windows-forbidden-apis-are-matched-as-api-names-and-named");
+    var usingHelper = LocalWindowsAppGenerationEngine.AddSafeFrameworkUsings("using System;\nusing XlsxLite;\nclass A { void M() { var rows = XlsxLite.ReadSheet(\"a.xlsx\"); } }");
+    Check(!usingHelper.Contains("using XlsxLite", StringComparison.Ordinal) && usingHelper.Contains("XlsxLite.ReadSheet", StringComparison.Ordinal),
+        "using-a-helper-class-as-a-namespace-is-removed");
+    Check(LocalWindowsAppGenerationEngine.ExplainFailure("compile.failed: Program.cs(38,84): error CS1913: Member 'Click' cannot be initialized.").Contains("button.Click += OnClick", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ExplainFailure("compile.failed: Program.cs(15,18): error CS1031: Type expected").Contains("KeyValuePair<string, int>", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ExplainFailure("compile.failed: Program.cs(21,49): error CS0102: The type 'A.MainForm' already contains a definition for 'items'").Contains("declares 'items' twice", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ExplainFailure("compile.failed: Program.cs(65,20): error CS1061: 'System.Random' does not contain a definition for 'Shuffle'").Contains("random.Next(i + 1)", StringComparison.Ordinal),
+        "csharp5-compile-errors-come-with-the-way-to-write-it");
+    var nestedFixed = WindowsSourceAutoFix.RewriteNestedInitializerMembers("var b = new Button { Text = \"表\", FlatAppearance.BorderSize = 0, Size = new Size(80, 80), Font.Bold = x };");
+    Check(nestedFixed == "var b = new Button { Text = \"表\", FlatAppearance = { BorderSize = 0 }, Size = new Size(80, 80), Font = { Bold = x } };" &&
+          WindowsSourceAutoFix.RewriteNestedInitializerMembers("var l = new List<int> { a.B };") == "var l = new List<int> { a.B };",
+        "nested-initializer-members-are-rewritten:" + nestedFixed);
+    var strayFixed = WindowsSourceAutoFix.Apply("using System;\n```csharp\nclass A { string s = \"a\u0007\"; }\n```\n").Source;
+    Check(!strayFixed.Contains("```", StringComparison.Ordinal) && !strayFixed.Contains('\u0007') && strayFixed.Contains("class A", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ValidateSource("class A { }\n```").Contains("source.invalid-format-or-unicode:markdown-fence") &&
+          LocalWindowsAppGenerationEngine.ExplainFailure("source.invalid-format-or-unicode:replacement-character").Contains("U+FFFD", StringComparison.Ordinal),
+        "stray-fences-and-control-characters-are-removed-and-named");
+    var renamedIds = LocalWebAppGenerationEngine.RenameShellIds(new GeneratedWebAppCandidate("<p id=\"ls-status\"></p><div id=\"ls-status-area\"></div><span id=\"x\"></span><span id=\"x\"></span>", "document.getElementById('ls-status').textContent = 'ok';"));
+    Check(System.Text.RegularExpressions.Regex.Matches(renamedIds.Body, "id=\"ls-status-area\"").Count == 1 && renamedIds.Body.Contains("id=\"ls-status-area-2\"", StringComparison.Ordinal) &&
+          renamedIds.JavaScript.Contains("getElementById('ls-status-area-2')", StringComparison.Ordinal) && renamedIds.Body.Contains("id=\"x-2\"", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.ExplainFailure("compile.failed: Program.cs(146,5): error CS1519: Invalid token '{' in class, struct, or interface member declaration").Contains("outside any method", StringComparison.Ordinal),
+        "shell-ids-and-duplicate-ids-stay-unique:" + renamedIds.Body);
+    Check(LocalWindowsAppGenerationEngine.IsInteractive("card.MouseClick += OnCardClick;") && LocalWindowsAppGenerationEngine.IsInteractive("timer.Tick += OnTick;") &&
+          LocalWindowsAppGenerationEngine.IsInteractive("protected override void OnMouseDown(MouseEventArgs e) { }") && !LocalWindowsAppGenerationEngine.IsInteractive("int total = 0; total += 1;") &&
+          !LocalWindowsAppGenerationEngine.AddSafeFrameworkUsings("using System;\nusing DocumentFormat.OpenXml.Packaging;\nclass A { }").Contains("DocumentFormat", StringComparison.Ordinal) &&
+          LocalWindowsAppGenerationEngine.AddSafeFrameworkUsings("using System.Drawing.Printing;\nclass A { }").Contains("using System.Drawing.Printing;", StringComparison.Ordinal),
+        "windows-interactivity-counts-any-event-and-outside-usings-go");
+    var explained = "Here is the game:\n```csharp\nusing System;\npublic class GameForm : Form { }\n```\nRun it with csc.\n```\ncsc Program.cs\n```";
+    Check(LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence(explained) == "using System;\npublic class GameForm : Form { }" &&
+          LocalWindowsAppGenerationEngine.UnwrapWholeSourceFence("class A { }") == "class A { }",
+        "fenced-program-is-taken-out-of-an-explained-reply");
+    Check(LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["デスクトップを監視して締め切りを探す"], "class A { void M() { label.Text = \"x\"; } }").Count == 2 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["デスクトップを監視して締め切りを探す"], "var t = new Timer(); var d = DateTime.Today;").Count == 0 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["50個のエクセルを1つにまとめる"], "var rows = XlsxLite.ReadSheet(p);").Count == 0 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["拡張子ごとのフォルダーに振り分ける"], "listBox.Items.Add(f);").Count == 1 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["拡張子ごとのフォルダーに振り分ける"], "File.Move(f, Path.Combine(dir, name));").Count == 0 &&
+          OutputTargetAdvisor.Analyze("PDFの文字を書き換えたりページを回転したりできるアプリ").RecommendedKind == StudioProjectKind.WindowsApp &&
+          OutputTargetAdvisor.Analyze("PDFのページを並べ替えたり結合したりするアプリ").RecommendedKind == StudioProjectKind.DesktopOrWebApp &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["PDFの文字を書き換える"], "MessageBox.Show(\"書き換えました\");").Count == 1 &&
+          LocalWindowsAppGenerationEngine.RequirementsWithoutMechanism(["PDFの文字を書き換える"], "var doc = PdfLite.Open(path);").Count == 0 &&
+          OutputTargetAdvisor.Analyze("50個のエクセルファイルを1つにまとめるアプリ").RecommendedKind == StudioProjectKind.WindowsApp &&
+          OutputTargetAdvisor.Analyze("EXEで、PDFのページを回転するアプリ").RecommendedKind == StudioProjectKind.WindowsApp,
+        "windows-mechanisms-and-part-based-form-choice");
+    // The shapes of the false "passes" in the 2026-10-20 audit are refused; the working versions of the same apps are not.
+    var hiddenInput = "class F : Form { TextBox box; Button go; F() { box = new TextBox(); go = new Button(); Controls.Add(go); /* Controls.Add(box); */ } }";
+    var placedInput = "class F : Form { TextBox box; Button go; F() { box = new TextBox(); go = new Button(); Controls.AddRange(new Control[] { box, go }); } }";
+    var lockedButton = "class F : Form { Button run = new Button(); F() { run.Enabled = false; Controls.Add(run); } }";
+    var unlockedButton = "class F : Form { Button run = new Button(); F() { run.Enabled = false; Controls.Add(run); } void Pick() { run.Enabled = files.Count > 0; } }";
+    var renameOnPick = "class F : Form { void pick_Click(object s, EventArgs e) { var d = new FolderBrowserDialog(); if (d.ShowDialog() == DialogResult.OK) foreach (var f in Directory.GetFiles(d.SelectedPath)) File.Move(f, f + \".bak\"); } }";
+    var renameOnConfirm = "class F : Form { void pick_Click(object s, EventArgs e) { var d = new FolderBrowserDialog(); if (d.ShowDialog() == DialogResult.OK) { folder = d.SelectedPath; Preview(); } } void go_Click(object s, EventArgs e) { foreach (var f in Directory.GetFiles(folder)) File.Move(f, f + \".bak\"); } }";
+    var stubButton = "class F : Form { void merge_Click(object s, EventArgs e) { MessageBox.Show(\"まとめました\"); } }";
+    var dotPen = "class F : Form { void Canvas_MouseMove(object s, MouseEventArgs e) { g.DrawLine(pen, e.X, e.Y, e.X, e.Y); } }";
+    var linePen = "class F : Form { void Canvas_MouseMove(object s, MouseEventArgs e) { g.DrawLine(pen, last.X, last.Y, e.X, e.Y); last = e.Location; } }";
+    // These shapes are judged on their own; usability findings (labels, button widths, …) are checked separately below.
+    IReadOnlyList<string> CoreShapes(string source) => LocalWindowsAppGenerationEngine.FalseSuccessShapes(source).Except(LocalWindowsAppGenerationEngine.UsabilityShapes(source)).ToArray();
+    Check(CoreShapes(hiddenInput).SingleOrDefault()?.StartsWith("exe.control-not-on-screen:box", StringComparison.Ordinal) == true &&
+          CoreShapes(placedInput).Count == 0 &&
+          CoreShapes(lockedButton).SingleOrDefault()?.StartsWith("exe.never-enabled:run", StringComparison.Ordinal) == true &&
+          CoreShapes(unlockedButton).Count == 0 &&
+          CoreShapes(renameOnPick).SingleOrDefault()?.StartsWith("exe.changes-before-confirm:pick_Click", StringComparison.Ordinal) == true &&
+          CoreShapes(renameOnConfirm).Count == 0 &&
+          CoreShapes(stubButton).SingleOrDefault()?.StartsWith("exe.stub-handler:merge_Click", StringComparison.Ordinal) == true &&
+          CoreShapes(dotPen).SingleOrDefault()?.StartsWith("exe.draw-dots", StringComparison.Ordinal) == true &&
+          CoreShapes(linePen).Count == 0,
+        "exe-false-success-shapes-are-refused-and-working-versions-pass");
+    // The Excel merge of 2026-10-20: 50 workbooks read, only the first written, the school names gathered and dropped.
+    var firstOnlyMerge = "class F : Form { void go_Click(object s, EventArgs e) { var schoolNames = new List<string>(); var allData = new List<IList<string[]>>();\n" +
+                         " foreach (var file in Directory.GetFiles(folder, \"*.xlsx\")) { var data = XlsxLite.ReadSheet(file, \"Sheet1\"); schoolNames.Add(Path.GetFileNameWithoutExtension(file)); allData.Add(data); }\n" +
+                         " var combined = new List<string[]>(); combined.AddRange(allData[0]); XlsxLite.WriteSheet(output, \"結果\", combined); } }";
+    var wholeMerge = "class F : Form { void go_Click(object s, EventArgs e) { var combined = new List<string[]>();\n" +
+                     " foreach (var file in Directory.GetFiles(folder, \"*.xlsx\")) { var school = Path.GetFileNameWithoutExtension(file); foreach (var row in XlsxLite.ReadSheet(file, \"Sheet1\")) { var line = new List<string> { school }; line.AddRange(row); combined.Add(line.ToArray()); } }\n" +
+                     " XlsxLite.WriteSheet(output, \"結果\", combined); } }";
+    var firstOnlyFindings = LocalWindowsAppGenerationEngine.FalseSuccessShapes(firstOnlyMerge);
+    Check(firstOnlyFindings.Any(found => found.StartsWith("exe.collected-unused:schoolNames", StringComparison.Ordinal)) &&
+          firstOnlyFindings.Any(found => found.StartsWith("exe.only-first:allData", StringComparison.Ordinal)) &&
+          LocalWindowsAppGenerationEngine.FalseSuccessShapes(wholeMerge).Count == 0 &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "const rows = [];\nfor (const f of files) rows.push(await f.text());\nout.textContent = rows[0];").SingleOrDefault()?.StartsWith("behavior.only-first:rows", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "const names = [];\nfor (const f of files) names.push(f.name);\nout.textContent = 'done';").SingleOrDefault()?.StartsWith("behavior.collected-unused:names", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "const rows = [];\nfor (const f of files) rows.push(await f.text());\nout.textContent = rows.join('\\n');").Count == 0,
+        "gathered-then-dropped-data-is-refused:" + string.Join("|", firstOnlyFindings.Select(found => found.Split(':')[0] + ":" + found.Split(':')[1])));
+    Check(LocalWebAppGenerationEngine.FalseSuccessShapes("<button id=\"run\" disabled>変換</button>", "run.addEventListener('click', convert);").SingleOrDefault()?.StartsWith("behavior.never-enabled", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("<button id=\"run\" disabled>変換</button>", "input.addEventListener('input', () => { run.disabled = input.value === ''; });").Count == 0 &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "function convert() {\n const from = document.getElementById('unit').value;\n const to = document.getElementById('unit').value;\n}").SingleOrDefault()?.StartsWith("behavior.same-field-twice:unit", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "function convert() {\n const from = document.getElementById('from-unit').value;\n const to = document.getElementById('to-unit').value;\n}").Count == 0 &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "merge.addEventListener('click', () => { alert('まとめました'); });").SingleOrDefault()?.StartsWith("behavior.stub-handler", StringComparison.Ordinal) == true &&
+          LocalWebAppGenerationEngine.FalseSuccessShapes("", "merge.addEventListener('click', () => { status.textContent = `${rows.length}行をまとめました`; });").Count == 0,
+        "web-false-success-shapes-are-refused-and-working-versions-pass");
+    var growthCheckFolder = Path.Combine(Path.GetTempPath(), "ls-growth-check-" + Guid.NewGuid().ToString("N")[..8]);
+    Directory.CreateDirectory(growthCheckFolder);
+    await File.WriteAllTextAsync(Path.Combine(growthCheckFolder, "Program.cs"), "class InvoiceForm { void Show() { totalLabel.Text = total.ToString(); } }");
+    var printCheck = FeatureGrowth.WithMechanism((_, _) => Task.FromResult<IReadOnlyList<string>>([]), StudioProjectKind.WindowsApp, "印刷できる請求書の形で表示できます");
+    var withoutPrint = await printCheck(growthCheckFolder, CancellationToken.None);
+    await File.WriteAllTextAsync(Path.Combine(growthCheckFolder, "Program.cs"), "class InvoiceForm { PrintDocument doc = new PrintDocument(); }");
+    var withPrint = await printCheck(growthCheckFolder, CancellationToken.None);
+    Check(withoutPrint.Count == 1 && withoutPrint[0].Contains("mechanism-missing:print", StringComparison.Ordinal) && withPrint.Count == 0,
+        "an-added-feature-must-bring-its-mechanism");
     Check(LocalWindowsAppGenerationEngine.CollapseExcessBlankLines("\nclass App {\n\n\n    int score;   \n\n\n}\n\n") ==
           "class App {\n\n    int score;\n\n}\n",
         "windows-generated-source-collapses-excess-blank-lines");
@@ -3537,6 +4556,113 @@ try
     await CheckThrowsAsync(() => staleSession.ReplaceTextAsync("PROMPT.md", "検証済み", "確認済み"), "stale-read-blocked");
     await File.WriteAllTextAsync(promptPath, beforeExternalChange);
     await staleSession.CompleteAsync();
+
+    // The agent loop: looks, edits, is checked after every change, may finish only after a passing check.
+    var agentCheck = new Func<string, CancellationToken, Task<IReadOnlyList<string>>>(async (root, token) =>
+        (await File.ReadAllTextAsync(Path.Combine(root, "PROMPT.md"), token)).Contains("AGENT-OK", StringComparison.Ordinal) ? [] : ["PROMPT.md must contain AGENT-OK"]);
+    var agentModel = new ScriptedAgentModel(
+        "{\"action\":\"finish\"}",
+        "{\"action\":\"search\",\"query\":\"検証済み\"}",
+        "{\"action\":\"read\",\"path\":\"..\\\\outside.txt\"}",
+        "{\"action\":\"read\",\"path\":\"PROMPT.md\",\"start_line\":1,\"end_line\":3}",
+        "not json",
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"" + uniqueLine + "\",\"new_text\":\"" + uniqueLine + " AGENT-OK\"}",
+        "{\"action\":\"finish\",\"note\":\"done\"}");
+    var agentSession = await workspaceEngine.StartAsync(created);
+    var agentOutcome = await new AgentLoop(agentModel, agentCheck).RunAsync(agentSession, created, "PROMPT.md に AGENT-OK を書く");
+    Check(agentOutcome.Completed && agentOutcome.Reason == "done" && agentOutcome.Checks == 2 &&
+          agentOutcome.Steps[0] is { Action: "finish", Ok: false } && agentOutcome.Steps[2] is { Ok: false } && agentOutcome.Steps[4] is { Action: "invalid", Ok: false } &&
+          agentModel.Seen[0].Contains("PROMPT.md (", StringComparison.Ordinal) && agentModel.Seen[0].Contains("must contain AGENT-OK", StringComparison.Ordinal) &&
+          agentModel.Seen[2].Contains("PROMPT.md:", StringComparison.Ordinal) && agentModel.Seen[4].Contains("1: ", StringComparison.Ordinal) &&
+          agentModel.Seen[6].Contains("All checks passed", StringComparison.Ordinal) &&
+          File.ReadAllText(promptPath).Contains("AGENT-OK", StringComparison.Ordinal) && agentSession.IsVerified,
+        "agent-loop-reads-edits-checks-and-finishes-only-after-passing");
+    await agentSession.RollbackAsync();
+    // After each effective edit the next turn receives the current source, not the initial stale source. Otherwise a
+    // small model copies an old line into old_text repeatedly and cannot make a second coherent replacement.
+    var refreshedModel = new ScriptedAgentModel(
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"" + uniqueLine + "\",\"new_text\":\"" + uniqueLine + " AGENT-FIRST\"}",
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"" + uniqueLine + " AGENT-FIRST\",\"new_text\":\"" + uniqueLine + " AGENT-OK\"}",
+        "{\"action\":\"finish\",\"note\":\"fresh\"}");
+    var refreshedSession = await workspaceEngine.StartAsync(created);
+    var refreshedOutcome = await new AgentLoop(refreshedModel, agentCheck).RunAsync(refreshedSession, created, "PROMPT.mdを段階修正する");
+    Check(refreshedOutcome.Completed && refreshedOutcome.Checks == 3 &&
+          refreshedModel.FullSeen[1].Contains("AGENT-FIRST", StringComparison.Ordinal) &&
+          !refreshedModel.FullSeen[0].Contains("AGENT-FIRST", StringComparison.Ordinal) &&
+          File.ReadAllText(promptPath).Contains("AGENT-OK", StringComparison.Ordinal),
+        "agent-loop-refreshes-current-source-after-each-effective-edit");
+    await refreshedSession.RollbackAsync();
+    var stuckModel = new ScriptedAgentModel(Enumerable.Repeat("{\"action\":\"read\",\"path\":\"missing.txt\"}", 10).ToArray());
+    var stuckSession = await workspaceEngine.StartAsync(created);
+    var stuckOutcome = await new AgentLoop(stuckModel, agentCheck).RunAsync(stuckSession, created, "x");
+    Check(!stuckOutcome.Completed && stuckOutcome.Steps.Count == 3 &&
+          stuckOutcome.Reason == "stopped: the same rejected action and result were repeated three times" &&
+          File.ReadAllText(promptPath) == beforeExternalChange,
+        "agent-loop-stops-identical-rejected-action-after-three-and-rolls-back");
+    await stuckSession.RollbackAsync();
+    // A different occurrence/new_text is a distinct repair attempt even when the action, path and old_text match.
+    // The loop must not stop those progressive attempts as if the model had repeated one rejected operation.
+    var distinctRepairModel = new ScriptedAgentModel(
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"missing\",\"new_text\":\"first\"}",
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"missing\",\"new_text\":\"second\",\"occurrence\":2}",
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"missing\",\"new_text\":\"third\",\"occurrence\":3}");
+    var distinctRepairSession = await workspaceEngine.StartAsync(created);
+    var distinctRepairOutcome = await new AgentLoop(distinctRepairModel, agentCheck, 3).RunAsync(distinctRepairSession, created, "x");
+    Check(!distinctRepairOutcome.Completed && distinctRepairOutcome.Steps.Count == 3 && distinctRepairOutcome.Reason == "step limit reached",
+        "agent-loop-does-not-collapse-distinct-repair-attempts");
+    await distinctRepairSession.RollbackAsync();
+    // A refused replacement says where: how many times and on which lines, or the most similar line.
+    var whereModel = new ScriptedAgentModel(
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"\\n\",\"new_text\":\"\\n\\n\"}",
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"" + uniqueLine.Replace("目的", "目標") + "\",\"new_text\":\"x\"}");
+    var whereSession = await workspaceEngine.StartAsync(created);
+    await new AgentLoop(whereModel, agentCheck, 4).RunAsync(whereSession, created, "x");
+    Check(whereModel.Seen[1].Contains("old_text occurs", StringComparison.Ordinal) && whereModel.Seen[1].Contains("(lines 1, ", StringComparison.Ordinal) &&
+          whereModel.Seen[2].Contains("The most similar line is", StringComparison.Ordinal) && whereModel.Seen[2].Contains(uniqueLine, StringComparison.Ordinal),
+        "agent-loop-refusals-say-where-the-text-is");
+    await whereSession.RollbackAsync();
+    // The same text several times on one line: "occurrence" picks one.
+    var occurrenceModel = new ScriptedAgentModel(
+        "{\"action\":\"create\",\"path\":\"dup.js\",\"content\":\"x = 1; x = 1; x = 1;\"}",
+        "{\"action\":\"replace\",\"path\":\"dup.js\",\"old_text\":\"x = 1;\",\"new_text\":\"x = 2;\"}",
+        "{\"action\":\"replace\",\"path\":\"dup.js\",\"old_text\":\"x = 1;\",\"new_text\":\"x = 2;\",\"occurrence\":2}",
+        "{\"action\":\"create\",\"path\":\"loose.js\",\"content\":\"if (ok) {\\n    total = a + b;\\n}\"}",
+        "{\"action\":\"replace\",\"path\":\"loose.js\",\"old_text\":\"if (ok) { total = a + b; }\",\"new_text\":\"if (ok) { total = a + b + c; }\"}",
+        "{\"action\":\"append\",\"path\":\"loose.js\",\"content\":\"function added() { return 1; }\"}");
+    var occurrenceSession = await workspaceEngine.StartAsync(created);
+    await new AgentLoop(occurrenceModel, agentCheck, 7).RunAsync(occurrenceSession, created, "x");
+    var dupText = File.ReadAllText(Path.Combine(created, "dup.js"));
+    Check(occurrenceModel.Seen[2].Contains("\"occurrence\": n (1 = the first, on line 1)", StringComparison.Ordinal) && dupText == "x = 1; x = 2; x = 1;",
+        "agent-loop-replaces-the-chosen-occurrence-on-one-line:" + dupText);
+    Check(File.ReadAllText(Path.Combine(created, "loose.js")) == "if (ok) { total = a + b + c; }\n\nfunction added() { return 1; }\n", "agent-loop-forgives-spacing-and-appends-new-code:" + File.ReadAllText(Path.Combine(created, "loose.js")));
+    await occurrenceSession.RollbackAsync();
+    var checkTwiceModel = new ScriptedAgentModel("{\"action\":\"check\"}", "{\"action\":\"check\"}");
+    var checkTwiceSession = await workspaceEngine.StartAsync(created);
+    await new AgentLoop(checkTwiceModel, agentCheck, 3).RunAsync(checkTwiceSession, created, "x");
+    Check(!checkTwiceModel.Seen[1].Contains("Nothing has changed", StringComparison.Ordinal) && checkTwiceModel.Seen[2].Contains("Nothing has changed", StringComparison.Ordinal),
+        "agent-loop-says-a-repeated-check-tells-nothing-new");
+    await checkTwiceSession.RollbackAsync();
+
+    // Large plans in parts: the core is generated, then each later feature is added by the loop or rolled back.
+    var bigPlan = new StudioBlueprint("Big", "", "app", ["a", "b", "c", "d", "e"], [], [], [], []);
+    var (bigCore, bigLater) = FeatureGrowth.Split(bigPlan);
+    var growthModel = new ScriptedAgentModel(
+        "{\"action\":\"replace\",\"path\":\"PROMPT.md\",\"old_text\":\"" + uniqueLine + "\",\"new_text\":\"" + uniqueLine + " AGENT-OK\"}",
+        "{\"action\":\"finish\",\"note\":\"added\"}",
+        "{\"action\":\"read\",\"path\":\"missing.txt\"}", "{\"action\":\"read\",\"path\":\"missing.txt\"}", "{\"action\":\"read\",\"path\":\"missing.txt\"}");
+    var growthFeatureTwo = new Func<string, CancellationToken, Task<IReadOnlyList<string>>>(async (root, token) =>
+        growthModel.Seen.Count > 2 && !(await File.ReadAllTextAsync(Path.Combine(root, "PROMPT.md"), token)).Contains("FEATURE-E", StringComparison.Ordinal) ? ["needs FEATURE-E"] : await agentCheck(root, token));
+    var growth = new FeatureGrowth(smokePaths, new FakeLocalModelRuntime(new Uri("http://127.0.0.1:9/")), () => "qwen2.5-coder:7b-instruct-q3_K_S",
+        agentModel: _ => growthModel, checkOverride: growthFeatureTwo);
+    var grownFeatures = await growth.GrowAsync(created, StudioProjectKind.Agent, "big request", bigLater);
+    var grownText = FeatureGrowth.Describe(grownFeatures);
+    Check(bigCore.Features.Count == FeatureGrowth.CoreFeatures && bigLater.SequenceEqual(["d", "e"]) && FeatureGrowth.Split(bigCore).Later.Count == 0 &&
+          grownFeatures.Count == 2 && grownFeatures[0].Added && !grownFeatures[1].Added &&
+          File.ReadAllText(promptPath).Contains("AGENT-OK", StringComparison.Ordinal) &&
+          File.ReadAllText(Path.Combine(created, ".localstudio", "baseline", "files", "PROMPT.md")).Contains("AGENT-OK", StringComparison.Ordinal) &&
+          grownText.Contains("追加できた機能: d", StringComparison.Ordinal) && grownText.Contains("まだ入っていない機能", StringComparison.Ordinal) && grownText.Contains("e", StringComparison.Ordinal),
+        "large-plans-grow-feature-by-feature-keeping-only-passing-features");
+    await File.WriteAllTextAsync(promptPath, beforeExternalChange);
 
     var createRollbackSession = await workspaceEngine.StartAsync(created);
     var createdText = await createRollbackSession.CreateTextFileAsync("notes\\run-note.txt", "安全に作成\n");
@@ -3862,6 +4988,26 @@ sealed class FakeSettingsStore(LocalStudioSettings settings) : ISettingsStore
     public Task SaveAsync(LocalStudioSettings value, CancellationToken cancellationToken = default) => Task.CompletedTask;
 }
 
+sealed class ExhaustedGenerator(GeneratedProjectSource last) : IGenerativeProjectGenerator
+{
+    public Task<GeneratedProjectSource> GenerateAsync(StudioBlueprint blueprint, StudioProjectKind kind, IProgress<ProjectCreationProgress>? progress = null, CancellationToken cancellationToken = default, string? sourceRequest = null, IGenerationSteering? steering = null) =>
+        throw new InvalidDataException("attempts used up", new GenerationExhaustedException("attempts used up", last, ["broken script"]));
+}
+
+/// <summary>Replays fixed agent actions and records what the loop showed it.</summary>
+sealed class ScriptedAgentModel(params string[] replies) : IAgentModel
+{
+    private int _next;
+    public List<string> Seen { get; } = [];
+    public List<string> FullSeen { get; } = [];
+    public Task<string> NextAsync(string system, IReadOnlyList<(string Role, string Content)> turns, CancellationToken cancellationToken)
+    {
+        Seen.Add(turns[^1].Content);
+        FullSeen.Add(string.Join("\n", turns.Select(turn => turn.Role + ": " + turn.Content)));
+        return Task.FromResult(_next < replies.Length ? replies[_next++] : "{\"action\":\"finish\"}");
+    }
+}
+
 sealed class FixedGenerativeProjectGenerator(GeneratedProjectSource source) : IGenerativeProjectGenerator
 {
     public Task<GeneratedProjectSource> GenerateAsync(StudioBlueprint blueprint, StudioProjectKind kind, IProgress<ProjectCreationProgress>? progress = null, CancellationToken cancellationToken = default, string? sourceRequest = null, IGenerationSteering? steering = null) =>
@@ -3975,6 +5121,38 @@ sealed class FailFirstDevelopmentUnitVerifier(string unitToFailOnce) : IDevelopm
     }
 }
 
+sealed class ScriptedRequirementVerifier(params (string TestId, DeterministicRequirementVerification Outcome)[] script) : IRequirementVerifier
+{
+    private readonly Queue<(string TestId, DeterministicRequirementVerification Outcome)> _script = new(script);
+
+    public Task<DeterministicRequirementVerification> VerifyAsync(
+        string projectRoot,
+        ProjectTestDefinition definition,
+        CancellationToken cancellationToken = default)
+    {
+        if (_script.Count == 0) throw new InvalidOperationException("No scripted requirement verification remains.");
+        var next = _script.Dequeue();
+        if (!next.TestId.Equals(definition.Id, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Expected {next.TestId}, received {definition.Id}.");
+        return Task.FromResult(next.Outcome);
+    }
+}
+
+sealed class CountingDevelopmentPlanner(DevelopmentUnitPlan result) : IDevelopmentPlanningEngine
+{
+    public int CallCount { get; private set; }
+
+    public Task<DevelopmentUnitPlan> PlanAsync(
+        string productName,
+        string sourceRequest,
+        IProgress<PlanningProgress>? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        CallCount++;
+        return Task.FromResult(result);
+    }
+}
+
 sealed class RecordingPlanner(StudioBlueprint result) : IPlanningEngine
 {
     public int CallCount { get; private set; }
@@ -3984,4 +5162,24 @@ sealed class RecordingPlanner(StudioBlueprint result) : IPlanningEngine
         CallCount++;
         return Task.FromResult(result);
     }
+}
+
+static class AutomatedProcessErrorMode
+{
+    private const uint SemFailCriticalErrors = 0x0001;
+    private const uint SemNoGpFaultErrorBox = 0x0002;
+    private const uint SemNoOpenFileErrorBox = 0x8000;
+
+    public static bool SuppressWindowsErrorDialogs()
+    {
+        if (!OperatingSystem.IsWindows()) return true;
+        _ = SetErrorMode(SemFailCriticalErrors | SemNoGpFaultErrorBox | SemNoOpenFileErrorBox);
+        return (GetErrorMode() & SemNoGpFaultErrorBox) != 0;
+    }
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetErrorMode(uint mode);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetErrorMode();
 }

@@ -92,6 +92,9 @@ public sealed class SetupViewModel : ViewModelBase
         ResourceMode.Focus => "集中モード（あなたが選択）：AIに使えるメモリを広げます。他のアプリが遅くなる場合があります。",
         _ => "共存モード（標準）：OSと他のアプリのための予備を多めに残します。"
     };
+    /// <summary>Shows a mode chosen elsewhere (the chat's mode button).</summary>
+    public void ShowMode(ResourceMode mode) => Mode = mode;
+
     public AsyncRelayCommand UseFocusModeCommand { get; }
     public AsyncRelayCommand UseCoexistenceModeCommand { get; }
     public AsyncRelayCommand UseExpertModeCommand { get; }

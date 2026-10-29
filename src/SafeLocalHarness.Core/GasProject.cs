@@ -80,8 +80,15 @@ public static class GasStaticVerifier
         Check(!used.Contains("UrlFetchApp") || externalAccessApproved, "gas.external-access-approved", passed, errors);
         Check(!Regex.IsMatch(script, @"(?<![\w$])eval\s*\(|(?<![\w$.])Function\s*\(|\bnew\s+Function\b", RegexOptions.CultureInvariant), "gas.no-dynamic-code", passed, errors);
         var gsCode = new StringBuilder();
+        var syntaxErrors = new List<string>();
         foreach (var path in sources.Where(path => Path.GetExtension(path).Equals(".gs", StringComparison.OrdinalIgnoreCase)))
-            gsCode.Append(await File.ReadAllTextAsync(path, cancellationToken)).Append('\n');
+        {
+            var text = await File.ReadAllTextAsync(path, cancellationToken);
+            gsCode.Append(text).Append('\n');
+            if (SyntaxError(text) is { } syntax) syntaxErrors.Add($"gas.syntax:{Path.GetFileName(path)}: {syntax}");
+        }
+        // A script the editor cannot even save passed every check before (catalogue audit 2026-10-20): parse it as V8 does.
+        if (syntaxErrors.Count == 0) passed.Add("gas.syntax-valid"); else errors.AddRange(syntaxErrors);
         Check(TopLevelFunctions(gsCode.ToString()).Count > 0, "gas.has-entry-function", passed, errors);
         var html = new StringBuilder();
         foreach (var path in sources.Where(path => Path.GetExtension(path).Equals(".html", StringComparison.OrdinalIgnoreCase)))
@@ -89,6 +96,20 @@ public static class GasStaticVerifier
         // The dialog or sidebar runs in the user's browser; it loads nothing from outside, like LocalStudio web apps.
         Check(!Regex.IsMatch(html.ToString(), @"(src|href)\s*=\s*[""']?\s*(https?:|//)", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant), "gas.html-no-external", passed, errors);
         return new(errors.Count == 0, passed, errors, DateTimeOffset.Now);
+    }
+
+    /// <summary>The first syntax error in a script (with its line), or null when it parses as modern JavaScript.</summary>
+    public static string? SyntaxError(string script)
+    {
+        try
+        {
+            Jint.Engine.PrepareScript(script);
+            return null;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return ex.Message;
+        }
     }
 
     /// <summary>Names of functions declared at the start of a line (what the editor lists as runnable).</summary>

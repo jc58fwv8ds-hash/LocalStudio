@@ -18,6 +18,12 @@ public static class WindowsSourceAutoFix
         var fixes = new List<string>();
         var text = source;
 
+        // Stray fence lines ("```" or "```csharp" left in the middle) and control characters other than tab and line
+        // breaks are never C#; a memory game was refused for "invalid format" until the attempts ran out (2026-10-20).
+        var cleaned = Regex.Replace(text, @"(?m)^[ \t]*```[A-Za-z#]*[ \t]*\r?\n?", "");
+        cleaned = new string(cleaned.Where(character => !char.IsControl(character) || character is '\t' or '\r' or '\n').ToArray());
+        if (cleaned != text) { fixes.Add("stray-fences-or-control-characters"); text = cleaned; }
+
         var interpolated = RewriteInterpolatedStrings(text);
         if (interpolated != text) { fixes.Add("interpolated-strings"); text = interpolated; }
 
@@ -38,6 +44,11 @@ public static class WindowsSourceAutoFix
             text = Regex.Replace(text, @"\bpartial\s+class\b", "class");
             fixes.Add("partial-class");
         }
+
+        // "new Button { FlatAppearance.BorderSize = 0 }" is CS0747; C# writes it as a nested initializer,
+        // "FlatAppearance = { BorderSize = 0 }" (memory game repeated it after being told, catalogue 2026-10-20).
+        var nested = RewriteNestedInitializerMembers(text);
+        if (nested != text) { fixes.Add("nested-initializer"); text = nested; }
 
         // Path.Combine(Environment.SpecialFolder.X, …): the folder's path is Environment.GetFolderPath(…) (trial 2026-10-13).
         var folders = Regex.Replace(text, @"(?<!GetFolderPath\(\s*)\bEnvironment\.SpecialFolder\.(\w+)(?!\s*\))", "Environment.GetFolderPath(Environment.SpecialFolder.$1)");
@@ -78,10 +89,57 @@ public static class WindowsSourceAutoFix
 
         var entry = EnsureEntryPoint(text);
         if (entry != text) { fixes.Add("entry-point"); text = entry; }
+        var guarded = EnsureErrorMessage(text);
+        if (guarded != text) { fixes.Add("error-message"); text = guarded; }
         return new Result(text, fixes);
     }
 
+    /// <summary>
+    /// An error in a button's handler shows a message and the app stays open, instead of the .NET crash dialog (a rename
+    /// app ended with "file not found" when its button was pressed a second time, hands-on 2026-10-21). Added at the
+    /// start of Main, before any window exists, as Windows Forms requires.
+    /// </summary>
+    internal static string EnsureErrorMessage(string source)
+    {
+        if (source.Contains("ThreadException", StringComparison.Ordinal) || !source.Contains("Application.Run", StringComparison.Ordinal)) return source;
+        var main = Regex.Match(source, @"\bstatic\s+(?:void|int)\s+Main\s*\([^)]*\)\s*\{");
+        if (!main.Success) return source;
+        var indent = Regex.Match(source[..main.Index], @"[ \t]*$").Value + "    ";
+        var guard = "\n" + indent + "Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);\n" +
+                    indent + "Application.ThreadException += (localStudioSender, localStudioError) => MessageBox.Show(\"処理を続けられませんでした。\\n\" + localStudioError.Exception.Message, \"エラー\", MessageBoxButtons.OK, MessageBoxIcon.Warning);";
+        return source.Insert(main.Index + main.Length, guard);
+    }
+
     /// <summary>$"残り: {left} 秒" → string.Format("残り: {0} 秒", left); format specifiers are kept ({x:F1} → {0:F1}).</summary>
+    /// <summary>
+    /// In "new X { A.B = v, Text = t }" the member "A.B = v" becomes "A = { B = v }". Only initializers without nested
+    /// braces are touched, and members are split at top-level commas (so "new Size(1, 2)" stays whole).
+    /// </summary>
+    internal static string RewriteNestedInitializerMembers(string source) =>
+        Regex.Replace(source, @"\bnew\s+[A-Za-z_][\w.]*\s*(?:\(\s*\))?\s*\{(?<body>[^{}]*)\}", match =>
+        {
+            var body = match.Groups["body"].Value;
+            if (!Regex.IsMatch(body, @"(?:^|,)\s*[A-Za-z_]\w*\.[A-Za-z_]\w*\s*=(?!=)")) return match.Value;
+            var members = new List<string>();
+            var depth = 0;
+            var start = 0;
+            for (var i = 0; i < body.Length; i++)
+            {
+                if (body[i] is '(' or '[') depth++;
+                else if (body[i] is ')' or ']') depth--;
+                else if (body[i] == ',' && depth == 0) { members.Add(body[start..i]); start = i + 1; }
+            }
+            members.Add(body[start..]);
+            var rewritten = members.Select(member =>
+            {
+                var nestedMember = Regex.Match(member, @"^(?<lead>\s*)(?<outer>[A-Za-z_]\w*)\.(?<inner>[A-Za-z_]\w*)\s*=(?!=)\s*(?<value>[\s\S]*?)(?<trail>\s*)$");
+                return nestedMember.Success
+                    ? $"{nestedMember.Groups["lead"].Value}{nestedMember.Groups["outer"].Value} = {{ {nestedMember.Groups["inner"].Value} = {nestedMember.Groups["value"].Value} }}{nestedMember.Groups["trail"].Value}"
+                    : member;
+            });
+            return match.Value[..(match.Groups["body"].Index - match.Index)] + string.Join(",", rewritten) + "}";
+        });
+
     internal static string RewriteInterpolatedStrings(string source)
     {
         var output = new StringBuilder();

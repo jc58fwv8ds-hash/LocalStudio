@@ -241,9 +241,9 @@ internal static class StackAdapters
     public static IDevelopmentStackAdapter Node() => new CompositeDevelopmentStackAdapter(
         new("node", "Node / React / TypeScript", ["node", "npm-for-dependencies"], true, true, true, true),
         toolchain => Capability("node", [("node", toolchain.NodeExecutable)]),
-        new TauriRestoreAdapter(),
-        new TauriBuildAdapter(),
-        new TauriTestAdapter(),
+        new NodeRestoreAdapter(),
+        new NodeBuildAdapter(),
+        new NodeTestAdapter(),
         new NodeVerificationAdapter(),
         new SafeInventoryPackager());
 
@@ -259,9 +259,11 @@ internal static class StackAdapters
     public static IDevelopmentStackAdapter Tauri() => new CompositeDevelopmentStackAdapter(
         new("tauri", "Tauri / React / TypeScript / Rust", ["node", "npm", "cargo", "tauri-packager"], true, false, true, false),
         toolchain => Capability("tauri", [("node", toolchain.NodeExecutable), ("npm", toolchain.NpmCliPath), ("cargo", toolchain.CargoExecutable)]),
-        new NodeRestoreAdapter(),
-        new NodeBuildAdapter(),
-        new NodeTestAdapter(),
+        // Node and Tauri had each other's stages: a plain Node app was asked for Cargo.toml and Tauri never ran
+        // cargo (external review 2026-10-26).
+        new TauriRestoreAdapter(),
+        new TauriBuildAdapter(),
+        new TauriTestAdapter(),
         new TauriVerificationAdapter(),
         new UnqualifiedTauriPackager());
 
@@ -373,6 +375,9 @@ internal sealed class DotnetTestAdapter : ITestAdapter
             if (result.ExitCode != 0)
                 return DevelopmentProcessRunner.Failure(DevelopmentPipelineStage.Test, DevelopmentFailureKind.VerificationFailure, "test.failed", result);
         }
+        // A unit that asked for tests and has none is not tested, so it does not pass (external review 2026-10-26).
+        if (testProjects.Length == 0 && StackFiles.RequiresTests(context.Unit))
+            return DevelopmentStageResult.Fail(DevelopmentPipelineStage.Test, DevelopmentFailureKind.VerificationFailure, "dotnet.test-project-missing:" + context.Unit.VerificationKind);
         return DevelopmentStageResult.Pass(DevelopmentPipelineStage.Test, testProjects.Length == 0 ? "dotnet.no-test-project" : "dotnet.test-pass");
     }
 }
@@ -479,7 +484,10 @@ internal sealed class NodeTestAdapter : ITestAdapter
 {
     public async Task<DevelopmentStageResult> TestAsync(DevelopmentStackContext context, CancellationToken cancellationToken)
     {
-        foreach (var package in StackFiles.Find(context.CandidateRoot, "package.json"))
+        var packages = StackFiles.Find(context.CandidateRoot, "package.json");
+        if (StackFiles.RequiresTests(context.Unit) && !packages.Any(package => NodePackage.HasScript(package, "test")))
+            return DevelopmentStageResult.Fail(DevelopmentPipelineStage.Test, DevelopmentFailureKind.VerificationFailure, "node.test-script-missing:" + context.Unit.VerificationKind);
+        foreach (var package in packages)
         {
             if (!NodePackage.HasScript(package, "test")) continue;
             if (context.Toolchain.NpmCliPath is null)
@@ -653,6 +661,8 @@ internal static class NodePackage
 
 internal static class StackFiles
 {
+    public static bool RequiresTests(DevelopmentUnit unit) => unit.VerificationKind is "unit-test" or "integration-test";
+
     public static string[] Find(string root, string pattern) =>
         Directory.EnumerateFiles(root, pattern, SearchOption.AllDirectories)
             .Where(path => !path.Contains(Path.DirectorySeparatorChar + ".localstudio-cache" + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))

@@ -1,0 +1,695 @@
+// Reviewed helper written for the C# 5 compiler of Windows; newer compilers' null-annotation warnings do not apply to it.
+#pragma warning disable
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.IO.Compression;
+using System.Linq;
+using System.Text;
+using System.Xml.Linq;
+
+/// <summary>
+/// LocalStudio toolbox: reads and writes the cell values of .xlsx workbooks with the .NET Framework built into Windows
+/// (no Excel, no download). Values only: formulas give their last calculated value, styles are not kept.
+/// </summary>
+public static class XlsxLite
+{
+    private static readonly XNamespace Main = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+    private static readonly XNamespace DocRel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+    private static readonly XNamespace PackageRel = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+    /// <summary>The sheet names of a workbook, in order.</summary>
+    public static List<string> SheetNames(string path)
+    {
+        using (var zip = OpenForRead(path))
+            return Sheets(zip).Select(sheet => sheet.Key).ToList();
+    }
+
+    /// <summary>All rows of the first sheet; each row is an array of cell texts (empty cells are "").</summary>
+    public static List<string[]> ReadSheet(string path)
+    {
+        return ReadSheet(path, null);
+    }
+
+    /// <summary>All rows of the named sheet (or the first sheet when sheetName is null).</summary>
+    public static List<string[]> ReadSheet(string path, string sheetName)
+    {
+        using (var zip = OpenForRead(path))
+        {
+            var sheets = Sheets(zip);
+            if (sheets.Count == 0) throw new InvalidDataException("シートがありません: " + Path.GetFileName(path));
+            var chosen = sheetName == null ? sheets[0] : sheets.FirstOrDefault(sheet => sheet.Key == sheetName);
+            if (chosen.Key == null) throw new InvalidDataException("シート「" + sheetName + "」が見つかりません: " + Path.GetFileName(path));
+            var shared = SharedStrings(zip);
+            var entry = zip.GetEntry(chosen.Value);
+            if (entry == null) throw new InvalidDataException("シートの中身が見つかりません: " + chosen.Key);
+            XDocument document;
+            using (var stream = entry.Open()) document = XDocument.Load(stream);
+            var rows = new List<string[]>();
+            foreach (var row in document.Descendants(Main + "row"))
+            {
+                var rowNumber = ParseInt((string)row.Attribute("r"), rows.Count + 1);
+                while (rows.Count < rowNumber - 1) rows.Add(new string[0]);
+                var cells = new List<string>();
+                var next = 0;
+                foreach (var cell in row.Elements(Main + "c"))
+                {
+                    var column = ColumnIndex((string)cell.Attribute("r"), next);
+                    while (cells.Count < column) cells.Add("");
+                    cells.Add(CellText(cell, shared));
+                    next = column + 1;
+                }
+                rows.Add(cells.ToArray());
+            }
+            return rows;
+        }
+    }
+
+    /// <summary>Writes one sheet to a new workbook at path (the file is replaced when it exists).</summary>
+    public static void WriteSheet(string path, string sheetName, IList<string[]> rows)
+    {
+        var book = new List<KeyValuePair<string, IList<string[]>>>();
+        book.Add(new KeyValuePair<string, IList<string[]>>(sheetName, rows));
+        WriteBook(path, book);
+    }
+
+    /// <summary>Writes several sheets to a new workbook at path. Numbers are stored as numbers, everything else as text.</summary>
+    public static void WriteBook(string path, IList<KeyValuePair<string, IList<string[]>>> sheets)
+    {
+        if (sheets == null || sheets.Count == 0) throw new ArgumentException("書き出すシートがありません。");
+        var names = new List<string>();
+        foreach (var sheet in sheets) names.Add(UniqueSheetName(sheet.Key, names));
+        using (var file = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var zip = new ZipArchive(file, ZipArchiveMode.Create))
+        {
+            var types = new XElement(XName.Get("Types", "http://schemas.openxmlformats.org/package/2006/content-types"));
+            XNamespace ct = "http://schemas.openxmlformats.org/package/2006/content-types";
+            types.Add(new XElement(ct + "Default", new XAttribute("Extension", "rels"), new XAttribute("ContentType", "application/vnd.openxmlformats-package.relationships+xml")));
+            types.Add(new XElement(ct + "Default", new XAttribute("Extension", "xml"), new XAttribute("ContentType", "application/xml")));
+            types.Add(new XElement(ct + "Override", new XAttribute("PartName", "/xl/workbook.xml"), new XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml")));
+            for (var i = 0; i < names.Count; i++)
+                types.Add(new XElement(ct + "Override", new XAttribute("PartName", "/xl/worksheets/sheet" + (i + 1) + ".xml"), new XAttribute("ContentType", "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml")));
+            Put(zip, "[Content_Types].xml", types);
+
+            Put(zip, "_rels/.rels", new XElement(PackageRel + "Relationships",
+                new XElement(PackageRel + "Relationship", new XAttribute("Id", "rId1"),
+                    new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"), new XAttribute("Target", "xl/workbook.xml"))));
+
+            var sheetList = new XElement(Main + "sheets");
+            var workbookRels = new XElement(PackageRel + "Relationships");
+            for (var i = 0; i < names.Count; i++)
+            {
+                sheetList.Add(new XElement(Main + "sheet", new XAttribute("name", names[i]), new XAttribute("sheetId", i + 1), new XAttribute(DocRel + "id", "rId" + (i + 1))));
+                workbookRels.Add(new XElement(PackageRel + "Relationship", new XAttribute("Id", "rId" + (i + 1)),
+                    new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"), new XAttribute("Target", "worksheets/sheet" + (i + 1) + ".xml")));
+            }
+            Put(zip, "xl/workbook.xml", new XElement(Main + "workbook", new XAttribute(XNamespace.Xmlns + "r", DocRel.NamespaceName), sheetList));
+            Put(zip, "xl/_rels/workbook.xml.rels", workbookRels);
+
+            for (var i = 0; i < sheets.Count; i++)
+                Put(zip, "xl/worksheets/sheet" + (i + 1) + ".xml", SheetXml(sheets[i].Value ?? new List<string[]>()));
+        }
+    }
+
+    /// <summary>A sheet of plain values: numbers as numbers, everything else as text.</summary>
+    private static XElement SheetXml(IList<string[]> rows)
+    {
+        var data = new XElement(Main + "sheetData");
+        for (var r = 0; r < rows.Count; r++)
+        {
+            var row = new XElement(Main + "row", new XAttribute("r", r + 1));
+            var values = rows[r] ?? new string[0];
+            for (var c = 0; c < values.Length; c++)
+            {
+                var text = values[c] ?? "";
+                if (text.Length == 0) continue;
+                var reference = ColumnName(c) + (r + 1);
+                double number;
+                if (LooksNumeric(text) && double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out number))
+                    row.Add(new XElement(Main + "c", new XAttribute("r", reference), new XElement(Main + "v", number.ToString("R", CultureInfo.InvariantCulture))));
+                else
+                    row.Add(new XElement(Main + "c", new XAttribute("r", reference), new XAttribute("t", "inlineStr"),
+                        new XElement(Main + "is", new XElement(Main + "t", new XAttribute(XNamespace.Xml + "space", "preserve"), CleanXml(text)))));
+            }
+            data.Add(row);
+        }
+        return new XElement(Main + "worksheet", data);
+    }
+
+    /// <summary>
+    /// Copies one sheet from each workbook into one new workbook, keeping each sheet as it looks: cell formats, fonts,
+    /// borders, fills, number and date formats, merged cells, column widths, row heights, print settings, pictures and
+    /// shapes. Each source is (new sheet name, workbook path); "path|sheet name" picks a sheet other than the first.
+    /// Returns what could not be kept (empty when everything was); the source files are only read.
+    /// </summary>
+    public static List<string> CombineSheets(string path, IList<KeyValuePair<string, string>> sources)
+    {
+        return CombineSheets(path, sources, null, null);
+    }
+
+    /// <summary>
+    /// The same from a plain list of workbook paths: each sheet is named after its file (without .xlsx). A small model
+    /// could not build the (name, path) pairs and the merge app was never made (hands-on regeneration, 2026-10-26).
+    /// </summary>
+    public static List<string> CombineSheets(string path, IList<string> files)
+    {
+        return CombineSheets(path, Pairs(files), null, null);
+    }
+
+    /// <summary>The same from a plain list of paths, with a first sheet of values (one string[] per row, the first row the headings).</summary>
+    public static List<string> CombineSheets(string path, IList<string> files, string summarySheetName, IList<string[]> summaryRows)
+    {
+        return CombineSheets(path, Pairs(files), summarySheetName, summaryRows);
+    }
+
+    private static List<KeyValuePair<string, string>> Pairs(IList<string> files)
+    {
+        var pairs = new List<KeyValuePair<string, string>>();
+        if (files == null) return pairs;
+        foreach (var file in files) pairs.Add(new KeyValuePair<string, string>(Path.GetFileNameWithoutExtension(file.Split('|')[0]), file));
+        return pairs;
+    }
+
+    /// <summary>The same, with a first sheet of plain values (for example one row per school) named summarySheetName.</summary>
+    public static List<string> CombineSheets(string path, IList<KeyValuePair<string, string>> sources, string summarySheetName, IList<string[]> summaryRows)
+    {
+        if (sources == null || sources.Count == 0) throw new ArgumentException("まとめるシートがありません。");
+        var notes = new List<string>();
+        var names = new List<string>();
+        if (summaryRows != null) names.Add(UniqueSheetName(summarySheetName ?? "まとめ", names));
+        foreach (var source in sources) names.Add(UniqueSheetName(source.Key, names));
+        var parts = new List<KeyValuePair<string, byte[]>>();
+        var overrides = new Dictionary<string, string>();
+        var defaults = new Dictionary<string, string>();
+        defaults["rels"] = "application/vnd.openxmlformats-package.relationships+xml";
+        defaults["xml"] = "application/xml";
+        var definedNames = new List<XElement>();
+        XDocument styles = null;
+        string firstStyles = null;
+        byte[] theme = null;
+        var sheetPaths = new List<string>();
+        if (summaryRows != null)
+        {
+            sheetPaths.Add("xl/worksheets/sheet1.xml");
+            parts.Add(new KeyValuePair<string, byte[]>("xl/worksheets/sheet1.xml", Bytes(SheetXml(summaryRows))));
+        }
+        for (var i = 0; i < sources.Count; i++)
+        {
+            var spec = sources[i].Value ?? "";
+            var bar = spec.LastIndexOf('|');
+            var file = bar > 0 ? spec.Substring(0, bar) : spec;
+            var wanted = bar > 0 ? spec.Substring(bar + 1) : null;
+            var newName = names[summaryRows != null ? i + 1 : i];
+            var sheetPath = "xl/worksheets/sheet" + (sheetPaths.Count + 1) + ".xml";
+            using (var zip = OpenForRead(file))
+            {
+                var list = Sheets(zip);
+                if (list.Count == 0) throw new InvalidDataException("シートがありません: " + Path.GetFileName(file));
+                var chosenIndex = wanted == null ? 0 : list.FindIndex(item => item.Key == wanted);
+                if (chosenIndex < 0) throw new InvalidDataException("シート「" + wanted + "」が見つかりません: " + Path.GetFileName(file));
+                var chosen = list[chosenIndex];
+                var sourceStyles = LoadPart(zip, "xl/styles.xml");
+                if (styles == null)
+                {
+                    styles = sourceStyles != null ? new XDocument(sourceStyles) : MinimalStyles();
+                    firstStyles = sourceStyles == null ? "" : sourceStyles.ToString(SaveOptions.DisableFormatting);
+                    theme = ReadBytes(zip, "xl/theme/theme1.xml");
+                }
+                var maps = sourceStyles == null ? null
+                    : sourceStyles.ToString(SaveOptions.DisableFormatting) == firstStyles ? Identity(sourceStyles) : MergeStyles(styles, sourceStyles);
+                var sheet = LoadPart(zip, chosen.Value);
+                if (sheet == null) throw new InvalidDataException("シートの中身が見つかりません: " + chosen.Key);
+                var shared = zip.GetEntry("xl/sharedStrings.xml") == null ? new List<XElement>() : LoadPart(zip, "xl/sharedStrings.xml").Root.Elements(Main + "si").ToList();
+                RewriteSheet(sheet, shared, maps);
+                var types = ContentTypes(zip);
+                var dropped = CopyRelationships(zip, chosen.Value, sheetPath, "s" + (i + 1) + "_", parts, overrides, defaults, types, new Dictionary<string, string>());
+                if (dropped.Count > 0)
+                {
+                    foreach (var element in sheet.Root.Elements(Main + "tableParts").ToList()) element.Remove();
+                    notes.Add(Path.GetFileName(file) + ": " + string.Join("、", dropped.Distinct()) + "は写せませんでした");
+                }
+                parts.Add(new KeyValuePair<string, byte[]>(sheetPath, Bytes(sheet.Root)));
+                sheetPaths.Add(sheetPath);
+                // Print area and print titles of the copied sheet.
+                var workbook = LoadPart(zip, "xl/workbook.xml");
+                if (workbook != null)
+                    foreach (var name in workbook.Descendants(Main + "definedName"))
+                        if (((string)name.Attribute("name") ?? "").StartsWith("_xlnm.", StringComparison.Ordinal) && ParseInt((string)name.Attribute("localSheetId"), -1) == chosenIndex)
+                        {
+                            var copy = new XElement(name);
+                            copy.SetAttributeValue("localSheetId", sheetPaths.Count - 1);
+                            copy.Value = copy.Value.Replace("'" + chosen.Key.Replace("'", "''") + "'!", "'" + newName.Replace("'", "''") + "'!").Replace(chosen.Key + "!", "'" + newName.Replace("'", "''") + "'!");
+                            definedNames.Add(copy);
+                        }
+            }
+        }
+
+        using (var output = new FileStream(path, FileMode.Create, FileAccess.Write))
+        using (var zip = new ZipArchive(output, ZipArchiveMode.Create))
+        {
+            XNamespace ct = "http://schemas.openxmlformats.org/package/2006/content-types";
+            overrides["/xl/workbook.xml"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml";
+            overrides["/xl/styles.xml"] = "application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml";
+            if (theme != null) overrides["/xl/theme/theme1.xml"] = "application/vnd.openxmlformats-officedocument.theme+xml";
+            foreach (var sheetPath in sheetPaths) overrides["/" + sheetPath] = "application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml";
+            var typesRoot = new XElement(ct + "Types");
+            foreach (var pair in defaults) typesRoot.Add(new XElement(ct + "Default", new XAttribute("Extension", pair.Key), new XAttribute("ContentType", pair.Value)));
+            foreach (var pair in overrides) typesRoot.Add(new XElement(ct + "Override", new XAttribute("PartName", pair.Key), new XAttribute("ContentType", pair.Value)));
+            Put(zip, "[Content_Types].xml", typesRoot);
+            Put(zip, "_rels/.rels", new XElement(PackageRel + "Relationships",
+                new XElement(PackageRel + "Relationship", new XAttribute("Id", "rId1"),
+                    new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"), new XAttribute("Target", "xl/workbook.xml"))));
+            var sheetList = new XElement(Main + "sheets");
+            var workbookRels = new XElement(PackageRel + "Relationships");
+            for (var i = 0; i < sheetPaths.Count; i++)
+            {
+                sheetList.Add(new XElement(Main + "sheet", new XAttribute("name", names[i]), new XAttribute("sheetId", i + 1), new XAttribute(DocRel + "id", "rId" + (i + 1))));
+                workbookRels.Add(new XElement(PackageRel + "Relationship", new XAttribute("Id", "rId" + (i + 1)),
+                    new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"), new XAttribute("Target", sheetPaths[i].Substring(3))));
+            }
+            workbookRels.Add(new XElement(PackageRel + "Relationship", new XAttribute("Id", "rIdStyles"),
+                new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"), new XAttribute("Target", "styles.xml")));
+            if (theme != null)
+                workbookRels.Add(new XElement(PackageRel + "Relationship", new XAttribute("Id", "rIdTheme"),
+                    new XAttribute("Type", "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"), new XAttribute("Target", "theme/theme1.xml")));
+            var workbookRoot = new XElement(Main + "workbook", new XAttribute(XNamespace.Xmlns + "r", DocRel.NamespaceName), sheetList);
+            if (definedNames.Count > 0) workbookRoot.Add(new XElement(Main + "definedNames", definedNames));
+            // Formulas are calculated again when the workbook is opened (their sheets may have new neighbours).
+            workbookRoot.Add(new XElement(Main + "calcPr", new XAttribute("fullCalcOnLoad", "1")));
+            Put(zip, "xl/workbook.xml", workbookRoot);
+            Put(zip, "xl/_rels/workbook.xml.rels", workbookRels);
+            Put(zip, "xl/styles.xml", styles.Root);
+            if (theme != null) PutBytes(zip, "xl/theme/theme1.xml", theme);
+            foreach (var part in parts) PutBytes(zip, part.Key, part.Value);
+        }
+        return notes;
+    }
+
+    private sealed class StyleMaps
+    {
+        public int[] Xf;
+        public int[] Dxf;
+    }
+
+    private static StyleMaps Identity(XDocument styles)
+    {
+        var xfs = styles.Root.Element(Main + "cellXfs");
+        var dxfs = styles.Root.Element(Main + "dxfs");
+        return new StyleMaps
+        {
+            Xf = Enumerable.Range(0, xfs == null ? 0 : xfs.Elements(Main + "xf").Count()).ToArray(),
+            Dxf = Enumerable.Range(0, dxfs == null ? 0 : dxfs.Elements(Main + "dxf").Count()).ToArray()
+        };
+    }
+
+    // The parts of styles.xml in the order Excel requires.
+    private static readonly string[] StyleOrder = { "numFmts", "fonts", "fills", "borders", "cellStyleXfs", "cellXfs", "cellStyles", "dxfs", "tableStyles", "colors", "extLst" };
+
+    private static XElement StyleList(XDocument styles, string name)
+    {
+        var existing = styles.Root.Element(Main + name);
+        if (existing != null) return existing;
+        var created = new XElement(Main + name, new XAttribute("count", 0));
+        var position = Array.IndexOf(StyleOrder, name);
+        var after = styles.Root.Elements().FirstOrDefault(element => Array.IndexOf(StyleOrder, element.Name.LocalName) > position);
+        if (after != null) after.AddBeforeSelf(created); else styles.Root.Add(created);
+        return created;
+    }
+
+    private static int Append(XDocument target, XDocument source, string listName)
+    {
+        var list = StyleList(target, listName);
+        var offset = list.Elements().Count();
+        var from = source.Root.Element(Main + listName);
+        if (from != null) foreach (var item in from.Elements()) list.Add(new XElement(item));
+        list.SetAttributeValue("count", list.Elements().Count());
+        return offset;
+    }
+
+    /// <summary>Adds the source workbook's formats to the target's and says where each source cell format went.</summary>
+    private static StyleMaps MergeStyles(XDocument target, XDocument source)
+    {
+        var fonts = Append(target, source, "fonts");
+        var fills = Append(target, source, "fills");
+        var borders = Append(target, source, "borders");
+        var dxfs = Append(target, source, "dxfs");
+        var numFmts = new Dictionary<int, int>();
+        var targetFormats = StyleList(target, "numFmts");
+        var sourceFormats = source.Root.Element(Main + "numFmts");
+        if (sourceFormats != null)
+            foreach (var format in sourceFormats.Elements(Main + "numFmt"))
+            {
+                var id = ParseInt((string)format.Attribute("numFmtId"), 0);
+                var code = (string)format.Attribute("formatCode") ?? "";
+                var same = targetFormats.Elements(Main + "numFmt").FirstOrDefault(existing => (string)existing.Attribute("formatCode") == code);
+                if (same != null) { numFmts[id] = ParseInt((string)same.Attribute("numFmtId"), id); continue; }
+                var next = Math.Max(163, targetFormats.Elements(Main + "numFmt").Select(existing => ParseInt((string)existing.Attribute("numFmtId"), 0)).DefaultIfEmpty(0).Max()) + 1;
+                targetFormats.Add(new XElement(Main + "numFmt", new XAttribute("numFmtId", next), new XAttribute("formatCode", code)));
+                numFmts[id] = next;
+            }
+        targetFormats.SetAttributeValue("count", targetFormats.Elements().Count());
+        if (!targetFormats.HasElements) targetFormats.Remove();
+        var xfList = StyleList(target, "cellXfs");
+        var sourceXfs = source.Root.Element(Main + "cellXfs");
+        var map = new List<int>();
+        if (sourceXfs != null)
+            foreach (var xf in sourceXfs.Elements(Main + "xf"))
+            {
+                var copy = new XElement(xf);
+                Shift(copy, "fontId", fonts);
+                Shift(copy, "fillId", fills);
+                Shift(copy, "borderId", borders);
+                int mapped;
+                var formatId = ParseInt((string)copy.Attribute("numFmtId"), 0);
+                if (numFmts.TryGetValue(formatId, out mapped)) copy.SetAttributeValue("numFmtId", mapped);
+                copy.SetAttributeValue("xfId", 0);
+                map.Add(xfList.Elements(Main + "xf").Count());
+                xfList.Add(copy);
+            }
+        xfList.SetAttributeValue("count", xfList.Elements().Count());
+        var dxfCount = source.Root.Element(Main + "dxfs") == null ? 0 : source.Root.Element(Main + "dxfs").Elements().Count();
+        return new StyleMaps { Xf = map.ToArray(), Dxf = Enumerable.Range(dxfs, dxfCount).ToArray() };
+    }
+
+    private static void Shift(XElement element, string attribute, int offset)
+    {
+        var value = (string)element.Attribute(attribute);
+        if (value != null) element.SetAttributeValue(attribute, ParseInt(value, 0) + offset);
+    }
+
+    /// <summary>Cell formats point into the combined styles, and shared texts become texts of the cell itself.</summary>
+    private static void RewriteSheet(XDocument sheet, List<XElement> shared, StyleMaps maps)
+    {
+        foreach (var cell in sheet.Descendants(Main + "c"))
+        {
+            Remap(cell, "s", maps == null ? null : maps.Xf);
+            if ((string)cell.Attribute("t") != "s") continue;
+            var index = ParseInt((string)cell.Element(Main + "v"), -1);
+            var item = index >= 0 && index < shared.Count ? shared[index] : null;
+            cell.SetAttributeValue("t", "inlineStr");
+            foreach (var value in cell.Elements(Main + "v").ToList()) value.Remove();
+            var inline = new XElement(Main + "is");
+            if (item != null)
+                foreach (var part in item.Elements().Where(element => element.Name != Main + "rPh" && element.Name != Main + "phoneticPr")) inline.Add(new XElement(part));
+            cell.Add(inline);
+        }
+        foreach (var row in sheet.Descendants(Main + "row")) Remap(row, "s", maps == null ? null : maps.Xf);
+        foreach (var column in sheet.Descendants(Main + "col")) Remap(column, "style", maps == null ? null : maps.Xf);
+        foreach (var rule in sheet.Descendants(Main + "cfRule")) Remap(rule, "dxfId", maps == null ? null : maps.Dxf);
+        foreach (var view in sheet.Descendants(Main + "sheetView")) view.SetAttributeValue("tabSelected", null);
+    }
+
+    private static void Remap(XElement element, string attribute, int[] map)
+    {
+        var value = (string)element.Attribute(attribute);
+        if (value == null) return;
+        var index = ParseInt(value, 0);
+        element.SetAttributeValue(attribute, map != null && index >= 0 && index < map.Length ? map[index] : 0);
+    }
+
+    private sealed class PartTypes
+    {
+        public Dictionary<string, string> Overrides = new Dictionary<string, string>();
+        public Dictionary<string, string> Defaults = new Dictionary<string, string>();
+    }
+
+    private static PartTypes ContentTypes(ZipArchive zip)
+    {
+        var types = new PartTypes();
+        var document = LoadPart(zip, "[Content_Types].xml");
+        if (document == null) return types;
+        foreach (var element in document.Root.Elements())
+        {
+            if (element.Name.LocalName == "Override") types.Overrides[((string)element.Attribute("PartName") ?? "").TrimStart('/')] = (string)element.Attribute("ContentType");
+            else if (element.Name.LocalName == "Default") types.Defaults[((string)element.Attribute("Extension") ?? "").ToLowerInvariant()] = (string)element.Attribute("ContentType");
+        }
+        return types;
+    }
+
+    /// <summary>
+    /// Copies everything a part refers to (drawings, pictures, charts, comments, print settings), renamed with a prefix
+    /// so several workbooks' parts do not collide. Tables and pivot tables are left out (their names must be unique in a
+    /// workbook) and reported.
+    /// </summary>
+    private static List<string> CopyRelationships(ZipArchive zip, string partPath, string newPath, string prefix, List<KeyValuePair<string, byte[]>> parts,
+        Dictionary<string, string> overrides, Dictionary<string, string> defaults, PartTypes types, Dictionary<string, string> copied)
+    {
+        var dropped = new List<string>();
+        var relsPath = RelsPath(partPath);
+        var rels = LoadPart(zip, relsPath);
+        if (rels == null) return dropped;
+        var output = new XElement(PackageRel + "Relationships");
+        foreach (var rel in rels.Root.Elements(PackageRel + "Relationship"))
+        {
+            var type = (string)rel.Attribute("Type") ?? "";
+            if ((string)rel.Attribute("TargetMode") == "External") { output.Add(new XElement(rel)); continue; }
+            if (type.EndsWith("/table", StringComparison.Ordinal)) { dropped.Add("テーブル"); continue; }
+            if (type.EndsWith("/pivotTable", StringComparison.Ordinal)) { dropped.Add("ピボットテーブル"); continue; }
+            var target = (string)rel.Attribute("Target") ?? "";
+            var sourceTarget = Resolve(partPath, target);
+            string newTarget;
+            if (!copied.TryGetValue(sourceTarget, out newTarget))
+            {
+                var bytes = ReadBytes(zip, sourceTarget);
+                if (bytes == null) continue;
+                var slash = sourceTarget.LastIndexOf('/');
+                newTarget = sourceTarget.Substring(0, slash + 1) + prefix + sourceTarget.Substring(slash + 1);
+                copied[sourceTarget] = newTarget;
+                string contentType;
+                if (types.Overrides.TryGetValue(sourceTarget, out contentType)) overrides["/" + newTarget] = contentType;
+                else
+                {
+                    var extension = Path.GetExtension(sourceTarget).TrimStart('.').ToLowerInvariant();
+                    if (types.Defaults.TryGetValue(extension, out contentType)) defaults[extension] = contentType;
+                }
+                parts.Add(new KeyValuePair<string, byte[]>(newTarget, bytes));
+                dropped.AddRange(CopyRelationships(zip, sourceTarget, newTarget, prefix, parts, overrides, defaults, types, copied));
+            }
+            var copy = new XElement(rel);
+            copy.SetAttributeValue("Target", Relative(newPath, newTarget));
+            output.Add(copy);
+        }
+        parts.Add(new KeyValuePair<string, byte[]>(RelsPath(newPath), Bytes(output)));
+        return dropped;
+    }
+
+    private static string RelsPath(string part)
+    {
+        var slash = part.LastIndexOf('/');
+        return part.Substring(0, slash + 1) + "_rels/" + part.Substring(slash + 1) + ".rels";
+    }
+
+    private static string Resolve(string fromPart, string target)
+    {
+        if (target.StartsWith("/")) return target.TrimStart('/');
+        var segments = fromPart.Split('/').ToList();
+        segments.RemoveAt(segments.Count - 1);
+        foreach (var segment in target.Replace('\\', '/').Split('/'))
+        {
+            if (segment == "..") { if (segments.Count > 0) segments.RemoveAt(segments.Count - 1); }
+            else if (segment != "." && segment.Length > 0) segments.Add(segment);
+        }
+        return string.Join("/", segments);
+    }
+
+    private static string Relative(string fromPart, string toPart)
+    {
+        var from = fromPart.Split('/').ToList();
+        from.RemoveAt(from.Count - 1);
+        var to = toPart.Split('/').ToList();
+        var common = 0;
+        while (common < from.Count && common < to.Count - 1 && from[common] == to[common]) common++;
+        var steps = Enumerable.Repeat("..", from.Count - common).Concat(to.Skip(common));
+        return string.Join("/", steps);
+    }
+
+    private static XDocument LoadPart(ZipArchive zip, string name)
+    {
+        var entry = zip.GetEntry(name);
+        if (entry == null) return null;
+        using (var stream = entry.Open()) return XDocument.Load(stream);
+    }
+
+    private static byte[] ReadBytes(ZipArchive zip, string name)
+    {
+        var entry = zip.GetEntry(name);
+        if (entry == null) return null;
+        using (var stream = entry.Open())
+        using (var memory = new MemoryStream())
+        {
+            stream.CopyTo(memory);
+            return memory.ToArray();
+        }
+    }
+
+    private static XDocument MinimalStyles()
+    {
+        return new XDocument(new XElement(Main + "styleSheet",
+            new XElement(Main + "fonts", new XAttribute("count", 1), new XElement(Main + "font", new XElement(Main + "sz", new XAttribute("val", 11)), new XElement(Main + "name", new XAttribute("val", "游ゴシック")))),
+            new XElement(Main + "fills", new XAttribute("count", 2), new XElement(Main + "fill", new XElement(Main + "patternFill", new XAttribute("patternType", "none"))), new XElement(Main + "fill", new XElement(Main + "patternFill", new XAttribute("patternType", "gray125")))),
+            new XElement(Main + "borders", new XAttribute("count", 1), new XElement(Main + "border")),
+            new XElement(Main + "cellStyleXfs", new XAttribute("count", 1), new XElement(Main + "xf", new XAttribute("numFmtId", 0), new XAttribute("fontId", 0), new XAttribute("fillId", 0), new XAttribute("borderId", 0))),
+            new XElement(Main + "cellXfs", new XAttribute("count", 1), new XElement(Main + "xf", new XAttribute("numFmtId", 0), new XAttribute("fontId", 0), new XAttribute("fillId", 0), new XAttribute("borderId", 0), new XAttribute("xfId", 0)))));
+    }
+
+    private static byte[] Bytes(XElement root)
+    {
+        using (var memory = new MemoryStream())
+        {
+            using (var writer = new StreamWriter(memory, new UTF8Encoding(false)))
+                new XDocument(new XDeclaration("1.0", "UTF-8", "yes"), root).Save(writer);
+            return memory.ToArray();
+        }
+    }
+
+    private static void PutBytes(ZipArchive zip, string name, byte[] bytes)
+    {
+        var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
+        using (var stream = entry.Open()) stream.Write(bytes, 0, bytes.Length);
+    }
+
+    /// <summary>Turns an Excel date serial (for example "45567") into a date; returns false for other text.</summary>
+    public static bool TryReadDate(string text, out DateTime date)
+    {
+        double serial;
+        date = DateTime.MinValue;
+        if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out serial) || serial < 1 || serial > 2958465) return false;
+        date = DateTime.FromOADate(serial);
+        return true;
+    }
+
+    private static ZipArchive OpenForRead(string path)
+    {
+        // ReadWrite sharing: a workbook that is open in Excel can still be read.
+        var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        try { return new ZipArchive(stream, ZipArchiveMode.Read); }
+        catch (InvalidDataException) { stream.Dispose(); throw new InvalidDataException("Excelファイル（.xlsx）として読めません: " + Path.GetFileName(path)); }
+    }
+
+    private static List<KeyValuePair<string, string>> Sheets(ZipArchive zip)
+    {
+        var result = new List<KeyValuePair<string, string>>();
+        var workbookEntry = zip.GetEntry("xl/workbook.xml");
+        var relsEntry = zip.GetEntry("xl/_rels/workbook.xml.rels");
+        if (workbookEntry == null || relsEntry == null) return result;
+        XDocument workbook, rels;
+        using (var stream = workbookEntry.Open()) workbook = XDocument.Load(stream);
+        using (var stream = relsEntry.Open()) rels = XDocument.Load(stream);
+        var targets = new Dictionary<string, string>();
+        foreach (var rel in rels.Root.Elements(PackageRel + "Relationship"))
+        {
+            var target = ((string)rel.Attribute("Target") ?? "").Replace('\\', '/');
+            target = target.StartsWith("/") ? target.TrimStart('/') : "xl/" + target;
+            targets[(string)rel.Attribute("Id") ?? ""] = target;
+        }
+        foreach (var sheet in workbook.Descendants(Main + "sheet"))
+        {
+            string target;
+            if (targets.TryGetValue((string)sheet.Attribute(DocRel + "id") ?? "", out target))
+                result.Add(new KeyValuePair<string, string>((string)sheet.Attribute("name") ?? "", target));
+        }
+        return result;
+    }
+
+    private static List<string> SharedStrings(ZipArchive zip)
+    {
+        var result = new List<string>();
+        var entry = zip.GetEntry("xl/sharedStrings.xml");
+        if (entry == null) return result;
+        XDocument document;
+        using (var stream = entry.Open()) document = XDocument.Load(stream);
+        foreach (var item in document.Root.Elements(Main + "si"))
+            result.Add(string.Concat(item.Descendants(Main + "t").Where(t => t.Parent.Name != Main + "rPh").Select(t => t.Value)));
+        return result;
+    }
+
+    private static string CellText(XElement cell, List<string> shared)
+    {
+        var type = (string)cell.Attribute("t");
+        var value = (string)cell.Element(Main + "v");
+        if (type == "inlineStr")
+            return string.Concat(cell.Descendants(Main + "t").Select(t => t.Value));
+        if (value == null) return "";
+        if (type == "s")
+        {
+            var index = ParseInt(value, -1);
+            return index >= 0 && index < shared.Count ? shared[index] : "";
+        }
+        if (type == "b") return value == "1" ? "TRUE" : "FALSE";
+        return value;
+    }
+
+    private static int ColumnIndex(string reference, int fallback)
+    {
+        if (string.IsNullOrEmpty(reference)) return fallback;
+        var index = 0;
+        var letters = 0;
+        foreach (var ch in reference)
+        {
+            if (ch < 'A' || ch > 'Z') break;
+            index = index * 26 + (ch - 'A' + 1);
+            letters++;
+        }
+        return letters == 0 ? fallback : index - 1;
+    }
+
+    private static string ColumnName(int index)
+    {
+        var name = "";
+        index++;
+        while (index > 0)
+        {
+            var rest = (index - 1) % 26;
+            name = (char)('A' + rest) + name;
+            index = (index - 1) / 26;
+        }
+        return name;
+    }
+
+    private static int ParseInt(string text, int fallback)
+    {
+        int value;
+        return int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value) ? value : fallback;
+    }
+
+    private static bool LooksNumeric(string text)
+    {
+        // Codes such as "007" or phone-like "03-1234" stay text, as Excel would show them as typed.
+        if (text.Length > 15 || text.Trim() != text) return false;
+        if (text.Length > 1 && text[0] == '0' && text[1] != '.') return false;
+        foreach (var ch in text) if (!(char.IsDigit(ch) || ch == '.' || ch == '-' || ch == 'E' || ch == 'e' || ch == '+')) return false;
+        return true;
+    }
+
+    private static string UniqueSheetName(string wanted, List<string> taken)
+    {
+        var name = new string((wanted ?? "").Where(ch => "[]:*?/\\".IndexOf(ch) < 0).ToArray()).Trim();
+        if (name.Length == 0) name = "Sheet" + (taken.Count + 1);
+        if (name.Length > 31) name = name.Substring(0, 31);
+        var candidate = name;
+        var n = 2;
+        while (taken.Any(existing => string.Equals(existing, candidate, StringComparison.OrdinalIgnoreCase)))
+        {
+            var suffix = "(" + n++ + ")";
+            candidate = (name.Length + suffix.Length > 31 ? name.Substring(0, 31 - suffix.Length) : name) + suffix;
+        }
+        return candidate;
+    }
+
+    private static string CleanXml(string text)
+    {
+        var builder = new StringBuilder(text.Length);
+        foreach (var ch in text)
+            if (ch == '\t' || ch == '\n' || ch == '\r' || (ch >= 0x20 && ch <= 0xD7FF) || (ch >= 0xE000 && ch <= 0xFFFD) || char.IsSurrogate(ch))
+                builder.Append(ch);
+        return builder.ToString();
+    }
+
+    private static void Put(ZipArchive zip, string name, XElement root)
+    {
+        var entry = zip.CreateEntry(name, CompressionLevel.Optimal);
+        using (var writer = new StreamWriter(entry.Open(), new UTF8Encoding(false)))
+            new XDocument(new XDeclaration("1.0", "UTF-8", "yes"), root).Save(writer);
+    }
+}

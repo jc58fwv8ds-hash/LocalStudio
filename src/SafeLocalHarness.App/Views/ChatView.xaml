@@ -127,6 +127,39 @@
                                 ToolTip="フォルダーを選んで、中のファイル名をまとめて変える" AutomationProperties.Name="フォルダーを選ぶ" Click="OnFolderClick"/>
                         <Button Content="📄" FontSize="18" Padding="8,4" Background="Transparent" BorderThickness="0" Cursor="Hand"
                                 ToolTip="Word・Excel・PDF のファイルを選んで、内容を聞いたり直したりする（PDFは複数選ぶと結合できます）" AutomationProperties.Name="Word・Excel・PDFを選ぶ" Click="OnDocumentClick"/>
+                        <!-- The memory mode, switchable here at any time (user, 2026-10-19); Expert asks for confirmation first. -->
+                        <Button x:Name="ModeButton" Content="{Binding ModeLabel}" ToolTip="{Binding ModeToolTip}" FontSize="12" Padding="10,3" Margin="4,0,0,6"
+                                VerticalAlignment="Bottom" Cursor="Hand" BorderThickness="1" Click="OnModeClick" AutomationProperties.Name="メモリの使い方を切り替える">
+                            <Button.Template>
+                                <ControlTemplate TargetType="Button">
+                                    <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="{TemplateBinding BorderThickness}"
+                                            CornerRadius="12" Padding="{TemplateBinding Padding}">
+                                        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                                    </Border>
+                                </ControlTemplate>
+                            </Button.Template>
+                            <Button.Style>
+                                <Style TargetType="Button">
+                                    <Setter Property="Background" Value="Transparent"/>
+                                    <Setter Property="BorderBrush" Value="{StaticResource DividerBrush}"/>
+                                    <Setter Property="Foreground" Value="{StaticResource SecondaryTextBrush}"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding IsExpert}" Value="True">
+                                            <Setter Property="Background" Value="{StaticResource HeadingBrush}"/>
+                                            <Setter Property="BorderBrush" Value="{StaticResource HeadingBrush}"/>
+                                            <Setter Property="Foreground" Value="White"/>
+                                        </DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </Button.Style>
+                            <Button.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="共存モード（標準）：他のアプリの分を多めに残す" Command="{Binding SetModeCommand}" CommandParameter="Coexistence"/>
+                                    <MenuItem Header="集中モード：AIに使えるメモリを広げる" Command="{Binding SetModeCommand}" CommandParameter="Focus"/>
+                                    <MenuItem Header="エキスパートモード：空いているメモリをほぼすべて使う（今回の起動中のみ）" Command="{Binding SetModeCommand}" CommandParameter="Expert"/>
+                                </ContextMenu>
+                            </Button.ContextMenu>
+                        </Button>
                     </StackPanel>
                     <Grid Grid.Column="1" Margin="6,0">
                         <TextBox x:Name="InputBox" Text="{Binding Input, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" TextWrapping="Wrap"
