@@ -64,7 +64,7 @@ public sealed class ProjectFileInvariantRequirementVerifier : IRequirementVerifi
             result = passed ? "PASS" : "FAIL",
             assertions = results
         }, PortableProjectJson.JsonOptions);
-        return new(passed, Kind, summary, evidence);
+        return new(passed, Kind, summary, evidence, RequirementEvidenceClass.Structural);
     }
 
     private static void ValidateSpecification(ProjectTestSpecification specification)

@@ -7,7 +7,8 @@ public sealed record DeterministicRequirementVerification(
     bool Passed,
     string Kind,
     string Summary,
-    ReadOnlyMemory<byte> EvidenceContent);
+    ReadOnlyMemory<byte> EvidenceContent,
+    RequirementEvidenceClass EvidenceClass = RequirementEvidenceClass.Structural);
 
 public interface IRequirementVerifier
 {
@@ -69,10 +70,11 @@ public sealed class RequirementVerificationService(IRequirementVerifier verifier
             relativePath,
             evidenceHash,
             now,
-            outcome.Summary.Trim());
+            outcome.Summary.Trim(),
+            outcome.EvidenceClass);
         var testResults = cartridge.TestResults
             .Where(result => !result.TestId.Equals(testId, StringComparison.Ordinal))
-            .Append(new ProjectTestResult(testId, outcome.Passed ? "PASS" : "FAIL", relativePath, now))
+            .Append(new ProjectTestResult(testId, outcome.Passed ? "PASS" : "FAIL", relativePath, now, outcome.EvidenceClass))
             .OrderBy(result => result.TestId, StringComparer.Ordinal)
             .ToArray();
         var state = AggregateRequirementState(cartridge.TestDefinitions, testResults, requirement.Id);
@@ -119,9 +121,13 @@ public sealed class RequirementVerificationService(IRequirementVerifier verifier
             .ToDictionary(group => group.Key, group => group.Single().Status, StringComparer.Ordinal);
         var statuses = requiredTests.Select(test => byId.GetValueOrDefault(test.Id, "NOT_TESTED")).ToArray();
         if (statuses.Any(status => status.Equals("FAIL", StringComparison.Ordinal))) return RequirementState.Failed;
-        return statuses.All(status => status.Equals("PASS", StringComparison.Ordinal))
-            ? RequirementState.Passed
-            : RequirementState.NotTested;
+        if (!statuses.All(status => status.Equals("PASS", StringComparison.Ordinal))) return RequirementState.NotTested;
+        var resultById = results.GroupBy(item => item.TestId, StringComparer.Ordinal)
+            .ToDictionary(group => group.Key, group => group.Single(), StringComparer.Ordinal);
+        var hasCompletionEvidence = requiredTests
+            .Select(test => resultById[test.Id].EvidenceClass)
+            .Any(evidenceClass => evidenceClass is RequirementEvidenceClass.Behavioral or RequirementEvidenceClass.ManualConfirmed);
+        return hasCompletionEvidence ? RequirementState.Passed : RequirementState.NotTested;
     }
 
     private static async Task SaveLedgerAndCartridgeAsync(
@@ -168,6 +174,8 @@ public sealed class RequirementVerificationService(IRequirementVerifier verifier
             throw new InvalidDataException("Verifierのsummaryが不正です。");
         if (outcome.EvidenceContent.Length is < 1 or > MaximumEvidenceBytes)
             throw new InvalidDataException("Verifierのevidence sizeが不正です。");
+        if (!Enum.IsDefined(outcome.EvidenceClass) || outcome.EvidenceClass == RequirementEvidenceClass.Unclassified)
+            throw new InvalidDataException("Verifierのevidence classが未分類です。");
     }
 
     private static async Task WriteAtomicAsync(

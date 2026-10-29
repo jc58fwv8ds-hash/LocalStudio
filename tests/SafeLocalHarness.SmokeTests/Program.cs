@@ -510,9 +510,9 @@ Check(reopenedSession.Stage == DevelopmentSessionStage.AssembledAwaitingRequirem
       reopenedSession.ProjectRoot == sessionDestination && sessionPlanner.CallCount == 0,
     "development-session-reopens-its-existing-cartridge-idempotently");
 var requirementVerifier = new ScriptedRequirementVerifier(
-    ("TEST-EX-001-STATIC", new DeterministicRequirementVerification(true, "deterministic-static", "Domain static checks passed.", Encoding.UTF8.GetBytes("EX-001-STATIC:PASS"))),
-    ("TEST-EX-002", new DeterministicRequirementVerification(false, "deterministic-unit", "Pipeline test failed.", Encoding.UTF8.GetBytes("EX-002:FAIL"))),
-    ("TEST-EX-002", new DeterministicRequirementVerification(true, "deterministic-unit", "Pipeline test passed after repair.", Encoding.UTF8.GetBytes("EX-002:PASS"))));
+    ("TEST-EX-001-STATIC", new DeterministicRequirementVerification(true, "deterministic-behavior", "Domain behavior checks passed.", Encoding.UTF8.GetBytes("EX-001-BEHAVIOR:PASS"), RequirementEvidenceClass.Behavioral)),
+    ("TEST-EX-002", new DeterministicRequirementVerification(false, "deterministic-unit", "Pipeline test failed.", Encoding.UTF8.GetBytes("EX-002:FAIL"), RequirementEvidenceClass.Behavioral)),
+    ("TEST-EX-002", new DeterministicRequirementVerification(true, "deterministic-unit", "Pipeline test passed after repair.", Encoding.UTF8.GetBytes("EX-002:PASS"), RequirementEvidenceClass.Behavioral)));
 await CheckThrowsAsync(
     () => new RequirementVerificationService(requirementVerifier).VerifyAsync(sessionDestination, "TEST-EX-001"),
     "dag-release-gate-cannot-be-used-as-requirement-specific-evidence");
@@ -531,11 +531,6 @@ var specificDefinitions = preVerificationInspection.Cartridge.TestDefinitions
             ])
         }
         : definition with { Kind = "smoke-requirement-check" })
-    .Append(new ProjectTestDefinition(
-        "TEST-EX-001-STATIC",
-        "EX-001",
-        "smoke-requirement-check",
-        "A second independent deterministic check for the same requirement."))
     .ToArray();
 var specificResults = specificDefinitions.Select(definition => new ProjectTestResult(
     definition.Id,
@@ -556,7 +551,8 @@ var missingFileOutcome = await projectFileVerifier.VerifyAsync(
         ProjectFileInvariantRequirementVerifier.Kind,
         "A missing file must fail without running a process.",
         new ProjectTestSpecification(1, [new("file-exists", "src/Smoke.Domain/missing.cs")])));
-Check(!missingFileOutcome.Passed && Encoding.UTF8.GetString(missingFileOutcome.EvidenceContent.Span).Contains("file-missing", StringComparison.Ordinal),
+Check(!missingFileOutcome.Passed && missingFileOutcome.EvidenceClass == RequirementEvidenceClass.Structural &&
+      Encoding.UTF8.GetString(missingFileOutcome.EvidenceContent.Span).Contains("file-missing", StringComparison.Ordinal),
     "project-file-invariant-records-a-deterministic-missing-file-failure");
 await CheckThrowsAsync(
     () => projectFileVerifier.VerifyAsync(
@@ -591,10 +587,25 @@ await CheckThrowsAsync(
     "requirement-verification-refuses-tests-not-defined-by-the-cartridge");
 var firstRequirement = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-001");
 Check(firstRequirement.State == RequirementState.NotTested && !firstRequirement.CompletionAllowed,
-    "one-passing-test-does-not-pass-a-requirement-that-has-another-untested-test");
+    "structural-evidence-alone-does-not-complete-a-requirement");
+var structuralOnlyInspection = await ProjectCartridgeStore.InspectAsync(sessionDestination);
+var behavioralDefinition = new ProjectTestDefinition(
+    "TEST-EX-001-STATIC",
+    "EX-001",
+    "smoke-requirement-check",
+    "An independent deterministic behavior check for the same requirement.");
+await ProjectCartridgeStore.SaveAtomicAsync(sessionDestination, structuralOnlyInspection.Cartridge with
+{
+    TestDefinitions = structuralOnlyInspection.Cartridge.TestDefinitions.Append(behavioralDefinition).ToArray(),
+    TestResults = structuralOnlyInspection.Cartridge.TestResults.Append(new ProjectTestResult(
+        behavioralDefinition.Id,
+        "NOT_TESTED",
+        ".localstudio/verification/development-units.json",
+        structuralOnlyInspection.Cartridge.UpdatedAt)).ToArray()
+});
 var secondRequirementTest = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-001-STATIC");
 Check(secondRequirementTest.State == RequirementState.Passed && !secondRequirementTest.CompletionAllowed,
-    "a-requirement-passes-only-after-all-of-its-tests-pass");
+    "a-requirement-passes-only-after-structural-and-behavioral-evidence-pass");
 var failedRequirement = await requirementVerification.VerifyAsync(sessionDestination, "TEST-EX-002");
 Check(failedRequirement.State == RequirementState.Failed && !failedRequirement.CompletionAllowed,
     "failed-deterministic-verification-is-recorded-and-does-not-complete");
@@ -607,6 +618,8 @@ Check(repairedRequirement.CompletionAllowed && repairedRequirement.State == Requ
       RequirementLedgerPolicy.Validate(completedLedger).CompletionAllowed &&
       RequirementLedgerPolicy.Validate(completedInspection.Cartridge.RequirementLedger).CompletionAllowed &&
       completedInspection.Cartridge.TestResults.All(result => result.Status == "PASS") &&
+      completedInspection.Cartridge.TestResults.Single(result => result.TestId == "TEST-EX-001").EvidenceClass == RequirementEvidenceClass.Structural &&
+      completedInspection.Cartridge.TestResults.Single(result => result.TestId == "TEST-EX-001-STATIC").EvidenceClass == RequirementEvidenceClass.Behavioral &&
       evidenceFileHash == repairedRequirement.EvidenceSha256,
     "deterministic-requirement-evidence-completes-only-after-all-mandatory-tests-pass");
 var completedSession = await sessionService.RunAsync(resumedSessionRequest);

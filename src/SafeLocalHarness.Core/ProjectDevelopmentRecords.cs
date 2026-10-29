@@ -16,13 +16,23 @@ public enum RequirementState
     NotApplicable
 }
 
+[JsonConverter(typeof(JsonStringEnumConverter))]
+public enum RequirementEvidenceClass
+{
+    Unclassified,
+    Structural,
+    Behavioral,
+    ManualConfirmed
+}
+
 public sealed record RequirementEvidence(
     string EvidenceId,
     string Kind,
     string RelativePath,
     string Sha256,
     DateTimeOffset RecordedAt,
-    string Summary);
+    string Summary,
+    RequirementEvidenceClass EvidenceClass = RequirementEvidenceClass.Unclassified);
 
 public sealed record RequirementLedgerItem(
     string Id,
@@ -113,7 +123,12 @@ public sealed record ProjectTestDefinition(
     string Kind,
     string Description,
     [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] ProjectTestSpecification? Specification = null);
-public sealed record ProjectTestResult(string TestId, string Status, string EvidencePath, DateTimeOffset RecordedAt);
+public sealed record ProjectTestResult(
+    string TestId,
+    string Status,
+    string EvidencePath,
+    DateTimeOffset RecordedAt,
+    RequirementEvidenceClass EvidenceClass = RequirementEvidenceClass.Unclassified);
 
 public sealed record ProjectCartridge(
     int SchemaVersion,
